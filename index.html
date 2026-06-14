@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="theme-color" content="#ffffff" />
+<title>T7 naptár</title>
+<style>html,body{margin:0;padding:0;background:#F2F2F7;} #root{min-height:100vh;}</style>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root">Betöltés…</div>
+<script type="text/babel" data-presets="react">
+
+  // --- Tárolás shim: a Claude window.storage helyett localStorage (eszközönként) ---
+  window.storage = {
+    async get(key, shared){ try{ const v=localStorage.getItem("t7:"+key); return v?{key,value:v,shared}:null; }catch(e){ return null; } },
+    async set(key, value, shared){ try{ localStorage.setItem("t7:"+key, value); }catch(e){} return {key,value,shared}; },
+    async delete(key, shared){ try{ localStorage.removeItem("t7:"+key); }catch(e){} return {key,deleted:true,shared}; },
+    async list(prefix, shared){ const keys=[]; for(let i=0;i<localStorage.length;i++){ const k=localStorage.key(i); if(k&&k.startsWith("t7:"+(prefix||""))) keys.push(k.slice(3)); } return {keys,prefix,shared}; }
+  };
+  const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+
+/* ===================== Konstansok ===================== */
+const HONAPOK = ["január","február","március","április","május","június","július","augusztus","szeptember","október","november","december"];
+const NAPOK_ROVID = ["H","K","Sze","Cs","P","Szo","V"];
+const NAPOK_TELJES = ["Hétfő","Kedd","Szerda","Csütörtök","Péntek","Szombat","Vasárnap"];
+
+const SZINEK = [
+  { id:"red",hex:"#FF3B30",nev:"Piros" },{ id:"orange",hex:"#FF9500",nev:"Narancs" },{ id:"yellow",hex:"#FFC400",nev:"Sárga" },
+  { id:"green",hex:"#34C759",nev:"Zöld" },{ id:"teal",hex:"#30B0C7",nev:"Türkiz" },{ id:"blue",hex:"#007AFF",nev:"Kék" },
+  { id:"indigo",hex:"#5856D6",nev:"Indigó" },{ id:"purple",hex:"#AF52DE",nev:"Lila" },{ id:"pink",hex:"#FF2D55",nev:"Rózsaszín" },
+];
+
+const KATEGORIAK = [
+  { id:"megbeszeles", nev:"Megbeszélés", ikon:"💬", tavollet:false },
+  { id:"hatarido",    nev:"Határidő",    ikon:"⏰", tavollet:false },
+  { id:"ugyfel",      nev:"Ügyfél",      ikon:"🤝", tavollet:false },
+  { id:"belso",       nev:"Belső",       ikon:"🏢", tavollet:false },
+  { id:"szabadsag",   nev:"Szabadság",   ikon:"🌴", tavollet:"tavol" },
+  { id:"beteg",       nev:"Betegszabadság", ikon:"🤒", tavollet:"tavol" },
+  { id:"homeoffice",  nev:"Home office", ikon:"🏠", tavollet:"ho" },
+  { id:"kikuldetes",  nev:"Kiküldetés",  ikon:"✈️", tavollet:"tavol" },
+  { id:"kepzes",      nev:"Képzés",      ikon:"📚", tavollet:"tavol" },
+  { id:"egyeb",       nev:"Egyéb",       ikon:"📌", tavollet:false },
+];
+const SZEREPEK = [{id:"admin",nev:"Admin"},{id:"szerkeszto",nev:"Szerkesztő"},{id:"nezo",nev:"Néző"}];
+
+const KEY_KOLLEGAK = "csapatnaptar:kollegak";
+const KEY_ESEMENYEK = "csapatnaptar:esemenyek";
+const KEY_ENID = "csapatnaptar:enId";   // személyes (nem megosztott)
+const KEY_TEMA = "csapatnaptar:tema";   // személyes
+
+const APP_NEV = "T7 naptár";
+const VERZIO = "v1.0.3";
+
+const KEZDO_KOLLEGAK = [
+  { id:"k1", nev:"Anna",  szin:"blue",   email:"", csapat:"Értékesítés", szerep:"admin" },
+  { id:"k2", nev:"Béla",  szin:"green",  email:"", csapat:"Fejlesztés",  szerep:"szerkeszto" },
+  { id:"k3", nev:"Csaba", szin:"orange", email:"", csapat:"Fejlesztés",  szerep:"szerkeszto" },
+];
+
+/* ===================== Segédfüggvények ===================== */
+const ujId = () => Math.random().toString(36).slice(2,10);
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`;
+const azonosNap = (a,b) => a.getFullYear()===b.getFullYear() && a.getMonth()===b.getMonth() && a.getDate()===b.getDate();
+const szinHex = (id) => (SZINEK.find(s=>s.id===id)||SZINEK[5]).hex;
+const hetfoIndex = (d) => (d.getDay()+6)%7;
+const rovidDatum = (iso) => { const [,m,d]=iso.split("-"); return `${parseInt(m,10)}. ${parseInt(d,10)}.`; };
+const ervenyesEmail = (em) => !!em && /\S+@\S+\.\S+/.test(em);
+const kat = (id) => KATEGORIAK.find(k=>k.id===id) || KATEGORIAK[0];
+const enc = (s) => encodeURIComponent(s);
+
+function honapNapjai(ev, honap){
+  const elso=new Date(ev,honap,1); const kezdet=new Date(ev,honap,1-hetfoIndex(elso)); const t=[];
+  for(let i=0;i<42;i++){ const d=new Date(kezdet); d.setDate(kezdet.getDate()+i); t.push(d);} return t;
+}
+function hetKezdet(d){ const x=new Date(d); x.setDate(x.getDate()-hetfoIndex(x)); x.setHours(0,0,0,0); return x; }
+
+function normalizal(e){
+  return {
+    id:e.id||ujId(), cim:e.cim||"",
+    kollegaIds:Array.isArray(e.kollegaIds)?e.kollegaIds:(e.kollegaId?[e.kollegaId]:[]),
+    kategoria:e.kategoria||"megbeszeles", allapot:e.allapot||"megerosit",
+    egeszNapos:!!e.egeszNapos, datum:e.datum, vegDatum:e.vegDatum||e.datum,
+    kezdo:e.kezdo||"09:00", veg:e.veg||"10:00", helyszin:e.helyszin||"", link:e.link||"", megjegyzes:e.megjegyzes||"",
+    ismetles:e.ismetles||"nincs", ismetlesVeg:e.ismetlesVeg||"",
+    letrehozta:e.letrehozta||"", modositotta:e.modositotta||"", modositva:e.modositva||"",
+  };
+}
+
+/* Előfordul-e az esemény az adott napon (ismétlést is kezeli) */
+function elofordul(e, d){
+  const nap = ymd(d);
+  if(!e.ismetles || e.ismetles==="nincs") return e.datum<=nap && (e.vegDatum||e.datum)>=nap;
+  if(nap < e.datum) return false;
+  if(e.ismetlesVeg && nap > e.ismetlesVeg) return false;
+  const start = new Date(e.datum+"T00:00:00");
+  if(e.ismetles==="nap") return true;
+  if(e.ismetles==="het") return d.getDay()===start.getDay();
+  if(e.ismetles==="honap") return d.getDate()===start.getDate();
+  return false;
+}
+
+/* Magyar ünnepnapok */
+function husvet(ev){
+  const a=ev%19,b=Math.floor(ev/100),c=ev%100,dd=Math.floor(b/4),e=b%4,f=Math.floor((b+8)/25),g=Math.floor((b-f+1)/3),
+    h=(19*a+b-dd-g+15)%30,i=Math.floor(c/4),k=c%4,l=(32+2*e+2*i-h-k)%7,m=Math.floor((a+11*h+22*l)/451),
+    ho=Math.floor((h+l-7*m+114)/31),nap=((h+l-7*m+114)%31)+1;
+  return new Date(ev,ho-1,nap);
+}
+const unnepCache = {};
+function unnepekEv(ev){
+  if(unnepCache[ev]) return unnepCache[ev];
+  const h=husvet(ev); const add=(d,n)=>{const x=new Date(d);x.setDate(x.getDate()+n);return x;};
+  const m={}; const set=(d,nev)=>{m[ymd(d)]=nev;};
+  set(new Date(ev,0,1),"Újév"); set(new Date(ev,2,15),"Nemzeti ünnep");
+  set(add(h,-2),"Nagypéntek"); set(h,"Húsvétvasárnap"); set(add(h,1),"Húsvéthétfő");
+  set(new Date(ev,4,1),"A munka ünnepe"); set(add(h,49),"Pünkösdvasárnap"); set(add(h,50),"Pünkösdhétfő");
+  set(new Date(ev,7,20),"Államalapítás"); set(new Date(ev,9,23),"1956 emléknapja");
+  set(new Date(ev,10,1),"Mindenszentek"); set(new Date(ev,11,25),"Karácsony"); set(new Date(ev,11,26),"Karácsony másnapja");
+  unnepCache[ev]=m; return m;
+}
+const unnepNev = (d) => unnepekEv(d.getFullYear())[ymd(d)] || null;
+
+/* ===================== Értesítés / export ===================== */
+function esemenyKollegak(e,kollegak){ return e.kollegaIds.map(id=>kollegak.find(k=>k.id===id)).filter(Boolean); }
+function esemenyEmailek(e,kollegak){ return esemenyKollegak(e,kollegak).map(k=>k.email).filter(ervenyesEmail); }
+function idopontSzoveg(e){
+  if(e.egeszNapos) return e.datum===e.vegDatum?`${e.datum} (egész nap)`:`${e.datum} – ${e.vegDatum} (egész nap)`;
+  return e.datum===e.vegDatum?`${e.datum} ${e.kezdo}–${e.veg}`:`${e.datum} ${e.kezdo} – ${e.vegDatum} ${e.veg}`;
+}
+function mailtoLink(e,kollegak){
+  const cimzettek=esemenyEmailek(e,kollegak).join(",");
+  const sorok=[`Esemény: ${e.cim||""}`,`Időpont: ${idopontSzoveg(e)}`,e.helyszin?`Helyszín: ${e.helyszin}`:"",e.link?`Link: ${e.link}`:"",e.megjegyzes?`\n${e.megjegyzes}`:""].filter(Boolean);
+  return `mailto:${cimzettek}?subject=${enc("Emlékeztető: "+(e.cim||"Esemény"))}&body=${enc(sorok.join("\n"))}`;
+}
+function veventSorok(e,kollegak){
+  const pad=n=>String(n).padStart(2,"0"); const most=new Date();
+  const stamp=`${most.getUTCFullYear()}${pad(most.getUTCMonth()+1)}${pad(most.getUTCDate())}T${pad(most.getUTCHours())}${pad(most.getUTCMinutes())}${pad(most.getUTCSeconds())}Z`;
+  const d=iso=>iso.replace(/-/g,""); const masnap=iso=>{const x=new Date(iso+"T00:00:00");x.setDate(x.getDate()+1);return d(ymd(x));};
+  let s,v;
+  if(e.egeszNapos){ s=`DTSTART;VALUE=DATE:${d(e.datum)}`; v=`DTEND;VALUE=DATE:${masnap(e.vegDatum)}`; }
+  else { s=`DTSTART:${d(e.datum)}T${(e.kezdo||"09:00").replace(":","")}00`; v=`DTEND:${d(e.vegDatum)}T${(e.veg||"10:00").replace(":","")}00`; }
+  const esc=x=>(x||"").replace(/([\\,;])/g,"\\$1").replace(/\n/g,"\\n");
+  const nevek=esemenyKollegak(e,kollegak).map(k=>k.nev).join(", ");
+  const leiras=[nevek?`Résztvevők: ${nevek}`:"", e.link?`Link: ${e.link}`:"", e.megjegyzes].filter(Boolean).join("\\n");
+  const reszt=esemenyKollegak(e,kollegak).filter(k=>ervenyesEmail(k.email)).map(k=>`ATTENDEE;CN=${esc(k.nev)}:mailto:${k.email}`);
+  let rrule="";
+  if(e.ismetles && e.ismetles!=="nincs"){
+    const f={nap:"DAILY",het:"WEEKLY",honap:"MONTHLY"}[e.ismetles];
+    rrule=`RRULE:FREQ=${f}${e.ismetlesVeg?`;UNTIL=${d(e.ismetlesVeg)}T235900Z`:""}`;
+  }
+  return ["BEGIN:VEVENT",`UID:${e.id}@t7naptar`,`DTSTAMP:${stamp}`,s,v,
+    `SUMMARY:${esc((kat(e.kategoria).ikon)+" "+e.cim)}`,
+    e.helyszin?`LOCATION:${esc(e.helyszin)}`:"", leiras?`DESCRIPTION:${leiras}`:"", rrule,
+    ...reszt,"BEGIN:VALARM","TRIGGER:-PT30M","ACTION:DISPLAY","DESCRIPTION:Emlékeztető","END:VALARM","END:VEVENT"
+  ].filter(Boolean);
+}
+function letolt(tartalom,nev,mime){
+  const blob=new Blob([tartalom],{type:mime+";charset=utf-8"}); const url=URL.createObjectURL(blob);
+  const a=document.createElement("a"); a.href=url; a.download=nev; document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url),1000);
+}
+function icsLetoltesEgy(e,kollegak){
+  letolt(["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//T7 naptár//HU","CALSCALE:GREGORIAN","METHOD:PUBLISH",...veventSorok(e,kollegak),"END:VCALENDAR"].join("\r\n"),
+    `${(e.cim||"esemeny").replace(/[^\p{L}\d]+/gu,"_").slice(0,40)||"esemeny"}.ics`,"text/calendar");
+}
+
+/* ===================== Tárolás ===================== */
+async function betolt(kulcs,alap,megosztott=true){
+  try{ const r=await window.storage.get(kulcs,megosztott); return r?JSON.parse(r.value):alap; }catch{ return alap; }
+}
+async function ment(kulcs,ertek,megosztott=true){
+  try{ await window.storage.set(kulcs,JSON.stringify(ertek),megosztott); }catch(e){ console.error(e); }
+}
+
+/* ===================== Fő komponens ===================== */
+function App(){
+  const ma = useMemo(()=>new Date(),[]);
+  const [betoltodik,setBetoltodik]=useState(true);
+  const [kollegak,setKollegak]=useState([]);
+  const [esemenyek,setEsemenyek]=useState([]);
+  const [enId,setEnId]=useState("");
+  const [temaSotet,setTemaSotet]=useState(false);
+
+  const [megjelenitettHonap,setMegjelenitettHonap]=useState(new Date(ma.getFullYear(),ma.getMonth(),1));
+  const [kivalasztottNap,setKivalasztottNap]=useState(new Date(ma.getFullYear(),ma.getMonth(),ma.getDate()));
+  const [nezet,setNezet]=useState("honap"); // honap | het | nap
+  const [szuro,setSzuro]=useState(null);
+  const [csapatSzuro,setCsapatSzuro]=useState("");
+  const [kereso,setKereso]=useState(null); // null = zárva, "" vagy szöveg = nyitva
+
+  const [modal,setModal]=useState(null);
+  const [kollegaPanel,setKollegaPanel]=useState(false);
+  const [beallitasok,setBeallitasok]=useState(false);
+
+  const [slide,setSlide]=useState(0);
+  const erint=useRef({x:0,y:0});
+
+  useEffect(()=>{(async()=>{
+    const k=await betolt(KEY_KOLLEGAK,null);
+    const e=await betolt(KEY_ESEMENYEK,[]);
+    const id=await betolt(KEY_ENID,"",false);
+    const t=await betolt(KEY_TEMA,false,false);
+    if(k===null){ await ment(KEY_KOLLEGAK,KEZDO_KOLLEGAK); setKollegak(KEZDO_KOLLEGAK); }
+    else setKollegak(k.map(x=>({email:"",csapat:"",szerep:"szerkeszto",...x})));
+    setEsemenyek((Array.isArray(e)?e:[]).map(normalizal));
+    setEnId(id||""); setTemaSotet(!!t);
+    setBetoltodik(false);
+  })();},[]);
+
+  const mentEsemenyek=useCallback((u)=>{ setEsemenyek(u); ment(KEY_ESEMENYEK,u); },[]);
+  const mentKollegak=useCallback((u)=>{ setKollegak(u); ment(KEY_KOLLEGAK,u); },[]);
+  const valtTema=()=>{ setTemaSotet(t=>{ const uj=!t; ment(KEY_TEMA,uj,false); return uj; }); };
+  const valtEnId=(id)=>{ setEnId(id); ment(KEY_ENID,id,false); };
+
+  const enKollega = kollegak.find(k=>k.id===enId) || null;
+  const canEdit = !enKollega || enKollega.szerep!=="nezo";
+  const csapatok = useMemo(()=>[...new Set(kollegak.map(k=>k.csapat).filter(Boolean))],[kollegak]);
+
+  const napok=useMemo(()=>honapNapjai(megjelenitettHonap.getFullYear(),megjelenitettHonap.getMonth()),[megjelenitettHonap]);
+
+  const lathato=useCallback((e)=>{
+    if(szuro && !e.kollegaIds.includes(szuro)) return false;
+    if(csapatSzuro && !e.kollegaIds.some(id=>kollegak.find(k=>k.id===id)?.csapat===csapatSzuro)) return false;
+    return true;
+  },[szuro,csapatSzuro,kollegak]);
+
+  const napAgenda=useCallback((d)=>esemenyek.filter(e=>lathato(e)&&elofordul(e,d))
+    .sort((a,b)=>a.egeszNapos!==b.egeszNapos?(a.egeszNapos?-1:1):(a.kezdo||"").localeCompare(b.kezdo||"")),[esemenyek,lathato]);
+
+  const kollegaSzin=(id)=>{ const k=kollegak.find(x=>x.id===id); return k?szinHex(k.szin):"#C7C7CC"; };
+  const esemenySzinek=(e)=> e.kollegaIds.length?e.kollegaIds.map(kollegaSzin):["#C7C7CC"];
+
+  /* Jelenlét egy kollégára adott napon */
+  const jelenlet=(kollegaId,d)=>{
+    const tav=esemenyek.filter(e=>e.kollegaIds.includes(kollegaId)&&elofordul(e,d)).map(e=>kat(e.kategoria)).filter(k=>k.tavollet);
+    if(!tav.length) return {ikon:"🏢",cimke:"Irodában"};
+    const ho=tav.find(k=>k.tavollet==="ho"); const tavol=tav.find(k=>k.tavollet==="tavol");
+    if(tavol) return {ikon:tavol.ikon,cimke:tavol.nev};
+    if(ho) return {ikon:"🏠",cimke:"Home office"};
+    return {ikon:"🏢",cimke:"Irodában"};
+  };
+
+  /* Navigáció */
+  const lepHonap=(i)=>{ setSlide(i); setMegjelenitettHonap(d=>new Date(d.getFullYear(),d.getMonth()+i,1)); };
+  const ugrasMa=()=>{ setSlide(0); const m=new Date(); setMegjelenitettHonap(new Date(m.getFullYear(),m.getMonth(),1)); setKivalasztottNap(new Date(m.getFullYear(),m.getMonth(),m.getDate())); };
+  const erintKezd=(e)=>{ const t=e.touches[0]; erint.current={x:t.clientX,y:t.clientY}; };
+  const erintVeg=(e)=>{ const t=e.changedTouches[0]; const dx=t.clientX-erint.current.x, dy=t.clientY-erint.current.y;
+    if(Math.abs(dx)>50&&Math.abs(dx)>Math.abs(dy)) lepHonap(dx<0?1:-1); };
+
+  /* Modal */
+  const ujEsemeny=()=>{ if(!canEdit) return; setModal({
+    id:null,cim:"",kollegaIds:[],kategoria:"megbeszeles",allapot:"megerosit",egeszNapos:false,
+    datum:ymd(kivalasztottNap),vegDatum:ymd(kivalasztottNap),kezdo:"09:00",veg:"10:00",
+    helyszin:"",link:"",megjegyzes:"",ismetles:"nincs",ismetlesVeg:"",
+  }); };
+  const nyitEsemeny=(e)=> setModal({...e,kollegaIds:[...e.kollegaIds]});
+
+  const mentModal=()=>{
+    if(!modal.cim.trim()||!canEdit) return;
+    const most=new Date().toISOString().slice(0,16).replace("T"," ");
+    const t={...modal}; if(t.vegDatum<t.datum) t.vegDatum=t.datum;
+    t.modositotta=enId; t.modositva=most; if(!t.letrehozta) t.letrehozta=enId;
+    const uj=t.id?esemenyek.map(e=>e.id===t.id?t:e):[...esemenyek,{...t,id:ujId()}];
+    mentEsemenyek(uj); setModal(null);
+  };
+  const torolModal=()=>{ if(!canEdit) return; mentEsemenyek(esemenyek.filter(e=>e.id!==modal.id)); setModal(null); };
+
+  /* Ütközések a modal eseményéhez */
+  const utkozesek=useMemo(()=>{
+    if(!modal) return [];
+    const d=new Date(modal.datum+"T00:00:00"); const lista=[];
+    esemenyek.forEach(e2=>{
+      if(e2.id===modal.id) return; if(!elofordul(e2,d)) return;
+      const kozos=modal.kollegaIds.filter(id=>e2.kollegaIds.includes(id)); if(!kozos.length) return;
+      let utk=true; if(!modal.egeszNapos&&!e2.egeszNapos) utk=(modal.kezdo<e2.veg)&&(e2.kezdo<modal.veg);
+      if(utk) kozos.forEach(id=>lista.push({nev:kollegak.find(k=>k.id===id)?.nev,cim:e2.cim}));
+    });
+    return lista;
+  },[modal,esemenyek,kollegak]);
+
+  /* Keresés */
+  const talalatok=useMemo(()=>{
+    const sz=(kereso||"").trim().toLowerCase(); if(!sz) return [];
+    return esemenyek.filter(e=>lathato(e)).filter(e=>{
+      const nevek=esemenyKollegak(e,kollegak).map(k=>k.nev).join(" ");
+      return [e.cim,e.helyszin,e.megjegyzes,nevek,kat(e.kategoria).nev].join(" ").toLowerCase().includes(sz);
+    }).sort((a,b)=>(a.datum+a.kezdo).localeCompare(b.datum+b.kezdo));
+  },[kereso,esemenyek,kollegak,lathato]);
+
+  /* Exportok / digest */
+  const osszesIcs=()=>letolt(["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//T7 naptár//HU","CALSCALE:GREGORIAN","METHOD:PUBLISH",
+    ...esemenyek.flatMap(e=>veventSorok(e,kollegak)),"END:VCALENDAR"].join("\r\n"),"T7-naptar.ics","text/calendar");
+  const csvExport=()=>{
+    const fej=["Cím","Kategória","Kezdő nap","Záró nap","Egész napos","Kezdés","Vége","Helyszín","Link","Kollégák","Állapot","Ismétlés","Megjegyzés"];
+    const sorok=esemenyek.map(e=>[e.cim,kat(e.kategoria).nev,e.datum,e.vegDatum,e.egeszNapos?"igen":"nem",e.egeszNapos?"":e.kezdo,e.egeszNapos?"":e.veg,
+      e.helyszin,e.link,esemenyKollegak(e,kollegak).map(k=>k.nev).join("; "),e.allapot==="elozetes"?"előzetes":"megerősített",
+      e.ismetles==="nincs"?"":({nap:"napi",het:"heti",honap:"havi"}[e.ismetles]||""),(e.megjegyzes||"").replace(/\n/g," ")]);
+    const csv=[fej,...sorok].map(r=>r.map(c=>`"${String(c??"").replace(/"/g,'""')}"`).join(",")).join("\r\n");
+    letolt("\uFEFF"+csv,"T7-naptar.csv","text/csv");
+  };
+  const napiDigestLink=()=>{
+    const d=kivalasztottNap; const lista=napAgenda(d);
+    const cimzettek=[...new Set(kollegak.map(k=>k.email).filter(ervenyesEmail))].join(",");
+    const sorok=lista.length?lista.map(e=>`• ${e.egeszNapos?"egész nap":e.kezdo+"–"+e.veg} ${kat(e.kategoria).ikon} ${e.cim}${e.helyszin?" ("+e.helyszin+")":""} – ${esemenyKollegak(e,kollegak).map(k=>k.nev).join(", ")}`):["Nincs program ezen a napon."];
+    return `mailto:${cimzettek}?subject=${enc(`Napi program – ${ymd(d)}`)}&body=${enc(sorok.join("\n"))}`;
+  };
+
+  if(betoltodik) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",fontFamily:FONT,color:"#8E8E93",background:temaSotet?"#000":"#F2F2F7"}}>{APP_NEV} betöltése…</div>;
+
+  /* ---- Egy esemény sor (több helyen újrahasznosítva) ---- */
+  const renderEsemeny=(e)=>{
+    const szinek=esemenySzinek(e); const k=kat(e.kategoria); const elozetes=e.allapot==="elozetes";
+    const tobbNapos=e.datum!==e.vegDatum && (!e.ismetles||e.ismetles==="nincs");
+    return (
+      <button key={e.id} onClick={()=>nyitEsemeny(e)} style={{...styles.esemenySor, opacity:elozetes?0.62:1}}>
+        <div style={{display:"flex",flexDirection:"column",width:4,borderRadius:4,overflow:"hidden",alignSelf:"stretch"}}>
+          {szinek.map((h,i)=><div key={i} style={{flex:1,background:h}} />)}
+        </div>
+        <div style={{width:62,textAlign:"right",flexShrink:0}}>
+          {e.egeszNapos?<div style={styles.ido}>egész nap</div>:<><div style={styles.ido}>{e.kezdo||"—"}</div><div style={styles.idoVeg}>{e.veg||""}</div></>}
+        </div>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={styles.esemenyCim}>{k.ikon} {e.cim}{elozetes?<span style={{color:"#8E8E93",fontWeight:400}}> (előzetes)</span>:null}</div>
+          <div style={styles.esemenyMeta}>
+            {e.kollegaIds.length?e.kollegaIds.map((id,i)=><span key={id} style={{color:kollegaSzin(id),fontWeight:600}}>{kollegak.find(k=>k.id===id)?.nev}{i<e.kollegaIds.length-1?", ":""}</span>):<span style={{color:"#8E8E93"}}>Nincs hozzárendelve</span>}
+            {e.helyszin?<span style={{color:"#8E8E93"}}>  ·  📍 {e.helyszin}</span>:null}
+            {e.link?<span style={{color:"#8E8E93"}}>  ·  🔗</span>:null}
+          </div>
+          {tobbNapos&&<div style={styles.tartomany}>📅 {rovidDatum(e.datum)} – {rovidDatum(e.vegDatum)}</div>}
+          {e.ismetles&&e.ismetles!=="nincs"&&<div style={styles.tartomany}>🔁 {({nap:"naponta",het:"hetente",honap:"havonta"}[e.ismetles])}</div>}
+        </div>
+      </button>
+    );
+  };
+
+  /* ---- Egy nap blokkja (hét nézethez) ---- */
+  const renderNapBlokk=(d)=>{
+    const lista=napAgenda(d); const u=unnepNev(d); const kivalasztott=azonosNap(d,kivalasztottNap);
+    return (
+      <div key={ymd(d)}>
+        <button onClick={()=>setKivalasztottNap(new Date(d))} style={{...styles.hetNapFej, ...(kivalasztott?{color:"#FF3B30"}:{})}}>
+          <span style={{fontWeight:700}}>{NAPOK_TELJES[hetfoIndex(d)]}</span>
+          <span style={{color:azonosNap(d,ma)?"#FF3B30":"#8E8E93"}}> {d.getDate()}. {HONAPOK[d.getMonth()]}</span>
+          {u&&<span style={{color:"#FF3B30",fontSize:12,marginLeft:8}}>🇭🇺 {u}</span>}
+        </button>
+        {lista.length?lista.map(renderEsemeny):<div style={styles.hetUres}>—</div>}
+      </div>
+    );
+  };
+
+  /* ---- Kiválasztott nap fejléce + jelenlét + események ---- */
+  const napFej=(d)=>{
+    const u=unnepNev(d);
+    return (
+      <div style={styles.agendaFej}>
+        <div>
+          <div style={styles.agendaDatum}>{NAPOK_TELJES[hetfoIndex(d)]}, {d.getDate()}. {HONAPOK[d.getMonth()]}</div>
+          {u&&<div style={{fontSize:13,color:"#FF3B30",marginTop:2}}>🇭🇺 {u}</div>}
+        </div>
+        {canEdit&&<button onClick={ujEsemeny} style={styles.agendaPlus}>＋ Esemény</button>}
+      </div>
+    );
+  };
+  const jelenletSav=(d)=> kollegak.length?(
+    <div style={styles.jelenletSav}>
+      <div style={styles.jelenletCim}>Jelenlét</div>
+      <div style={styles.jelenletLista}>
+        {kollegak.filter(k=>!csapatSzuro||k.csapat===csapatSzuro).map(k=>{ const j=jelenlet(k.id,d); return (
+          <div key={k.id} style={styles.jelenletElem} title={j.cimke}>
+            <span>{j.ikon}</span>
+            <span style={{color:szinHex(k.szin),fontWeight:600}}>{k.nev}</span>
+            <span style={{color:"#8E8E93",fontSize:12}}>{j.cimke}</span>
+          </div> ); })}
+      </div>
+    </div>
+  ):null;
+
+  const napEsemenyek=napAgenda(kivalasztottNap);
+
+  return (
+    <div className={temaSotet?"app sotet":"app"} style={styles.app}>
+      <style>{css}</style>
+
+      {/* ===== Fejléc ===== */}
+      <header style={styles.fejlec}>
+        <div style={styles.appSor}>
+          <button onClick={()=>{ setKereso(kereso===null?"":null); }} style={styles.appIkon} aria-label="Keresés">🔍</button>
+          <div style={styles.appCim}>{APP_NEV}</div>
+          <button onClick={()=>setBeallitasok(true)} style={styles.appIkon} aria-label="Beállítások">⚙️</button>
+        </div>
+
+        {kereso!==null && (
+          <div style={{padding:"0 12px 8px"}}>
+            <div style={{position:"relative"}}>
+              <input autoFocus value={kereso} onChange={e=>setKereso(e.target.value)} placeholder="Keresés eseményekben…"
+                style={styles.keresoInput}/>
+              {kereso && (
+                <button onMouseDown={e=>e.preventDefault()} onClick={()=>setKereso("")} style={styles.keresoTorol} aria-label="Keresés törlése">✕</button>
+              )}
+            </div>
+          </div>
+        )}
+
+        <div style={styles.fejlecFelso}>
+          <button onClick={()=>lepHonap(-1)} style={styles.chevron} aria-label="Előző hónap">‹</button>
+          <h1 style={styles.honapCim}>
+            <span style={{color:"#FF3B30"}}>{HONAPOK[megjelenitettHonap.getMonth()]}</span>{" "}
+            <span style={{color:"var(--txt)"}}>{megjelenitettHonap.getFullYear()}</span>
+          </h1>
+          <button onClick={()=>lepHonap(1)} style={styles.chevron} aria-label="Következő hónap">›</button>
+          <div style={{flex:1}} />
+          <button onClick={ugrasMa} style={styles.maGomb}>Ma</button>
+          <button onClick={()=>setKollegaPanel(true)} style={styles.ikonGomb} aria-label="Kollégák">👥</button>
+          {canEdit&&<button onClick={ujEsemeny} style={styles.plusGomb} aria-label="Új esemény">＋</button>}
+        </div>
+
+        {/* Nézetváltó */}
+        <div style={styles.szegmens}>
+          {[["honap","Hónap"],["het","Hét"],["nap","Nap"]].map(([id,nev])=>(
+            <button key={id} onClick={()=>setNezet(id)} style={{...styles.szegmensGomb, ...(nezet===id?styles.szegmensAktiv:{})}}>{nev}</button>
+          ))}
+        </div>
+
+        {/* Szűrők */}
+        <div style={styles.szuroSor}>
+          {csapatok.length>0 && (
+            <select value={csapatSzuro} onChange={e=>setCsapatSzuro(e.target.value)} style={styles.csapatSelect}>
+              <option value="">Minden csapat</option>
+              {csapatok.map(c=><option key={c} value={c}>{c}</option>)}
+            </select>
+          )}
+          <button onClick={()=>setSzuro(null)} style={{...styles.chip, ...(szuro===null?styles.chipAktiv:{})}}>Mindenki</button>
+          {kollegak.map(k=>{ const a=szuro===k.id; return (
+            <button key={k.id} onClick={()=>setSzuro(a?null:k.id)} style={{...styles.chip, ...(a?{background:szinHex(k.szin),color:"#fff",borderColor:szinHex(k.szin)}:{})}}>
+              <span style={{width:8,height:8,borderRadius:8,background:a?"#fff":szinHex(k.szin),display:"inline-block",marginRight:6}} />{k.nev}
+            </button> ); })}
+        </div>
+
+        {nezet==="honap" && (
+          <div style={styles.hetSor}>{NAPOK_ROVID.map((n,i)=><div key={n} style={{...styles.hetNap,color:i>=5?"#FF3B30":"#8E8E93"}}>{n}</div>)}</div>
+        )}
+      </header>
+
+      {/* ===== Keresési találatok ===== */}
+      {kereso!==null && kereso.trim() ? (
+        <section style={styles.agenda}>
+          <div style={{...styles.agendaFej}}><div style={styles.agendaDatum}>Találatok ({talalatok.length})</div></div>
+          {talalatok.length?talalatok.map(e=>(
+            <div key={e.id}>
+              <div style={styles.talalatDatum}>{rovidDatum(e.datum)}</div>
+              {renderEsemeny(e)}
+            </div>
+          )):<div style={styles.ures}>Nincs találat.</div>}
+        </section>
+      ) : (
+      <>
+        {/* ===== Hónap rács ===== */}
+        {nezet==="honap" && (
+          <div style={styles.racsKeret} onTouchStart={erintKezd} onTouchEnd={erintVeg}>
+            <div key={`${megjelenitettHonap.getFullYear()}-${megjelenitettHonap.getMonth()}`}
+              style={{...styles.racs, animation: slide===1?"beJobbrol .25s ease":slide===-1?"beBalrol .25s ease":undefined}}>
+              {napok.map((d,i)=>{
+                const ezAHonap=d.getMonth()===megjelenitettHonap.getMonth();
+                const maE=azonosNap(d,ma); const kiv=azonosNap(d,kivalasztottNap);
+                const hetvege=hetfoIndex(d)>=5; const u=unnepNev(d);
+                const lista=napAgenda(d); const szinek=[];
+                lista.forEach(e=>esemenySzinek(e).forEach(h=>{ if(!szinek.includes(h)) szinek.push(h); }));
+                return (
+                  <button key={i} onClick={()=>setKivalasztottNap(new Date(d))} style={styles.cellaGomb}>
+                    <div style={{...styles.napSzam, ...(maE?{background:"#FF3B30"}:kiv?{background:"#1C1C1E"}:{}),
+                      color: maE||kiv?"#fff":(!ezAHonap?"var(--faint)":(hetvege||u)?"#FF3B30":"var(--txt)")}}>{d.getDate()}</div>
+                    <div style={styles.pontSor}>{szinek.slice(0,4).map((h,idx)=><span key={idx} style={{width:5,height:5,borderRadius:5,background:h}} />)}</div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* ===== Tartalom nézet szerint ===== */}
+        {nezet==="het" ? (
+          <section style={styles.agenda}>
+            <div style={{...styles.agendaFej}}>
+              <div style={styles.agendaDatum}>A hét: {rovidDatum(ymd(hetKezdet(kivalasztottNap)))}</div>
+              {canEdit&&<button onClick={ujEsemeny} style={styles.agendaPlus}>＋ Esemény</button>}
+            </div>
+            {Array.from({length:7}).map((_,i)=>{ const d=new Date(hetKezdet(kivalasztottNap)); d.setDate(d.getDate()+i); return renderNapBlokk(d); })}
+          </section>
+        ) : (
+          <section style={styles.agenda}>
+            {napFej(kivalasztottNap)}
+            {jelenletSav(kivalasztottNap)}
+            {napEsemenyek.length?napEsemenyek.map(renderEsemeny):(
+              <div style={styles.ures}>Nincs esemény ezen a napon.{canEdit&&<div style={{marginTop:6,fontSize:13,color:"#C7C7CC"}}>Koppints a „＋ Esemény” gombra.</div>}</div>
+            )}
+          </section>
+        )}
+      </>
+      )}
+
+      <footer style={styles.verzio}>{VERZIO}</footer>
+
+      {/* ===== Esemény modal ===== */}
+      {modal && (
+        <div style={styles.overlay} onClick={()=>setModal(null)}>
+          <div style={styles.lap} onClick={e=>e.stopPropagation()}>
+            <div style={styles.lapFej}>
+              <button onClick={()=>setModal(null)} style={styles.lapMegse}>{canEdit?"Mégse":"Bezár"}</button>
+              <span style={styles.lapCim}>{modal.id?"Esemény":"Új esemény"}</span>
+              {canEdit?<button onClick={mentModal} style={{...styles.lapKesz,opacity:modal.cim.trim()?1:0.4}}>Kész</button>:<span style={{width:48}} />}
+            </div>
+            <div style={styles.lapTorzs}>
+              {!canEdit && <div style={styles.olvasBanner}>Csak megtekintés – nincs szerkesztési jogosultságod.</div>}
+
+              <input autoFocus={canEdit} disabled={!canEdit} value={modal.cim} onChange={e=>setModal({...modal,cim:e.target.value})}
+                placeholder="Cím (pl. Ügyfél-egyeztetés)" style={styles.cimInput}/>
+
+              {/* Kategória */}
+              <div style={styles.mezoCsoport}>
+                <label style={styles.mezo}><span style={styles.mezoCimke}>Kategória</span>
+                  <select disabled={!canEdit} value={modal.kategoria} onChange={e=>setModal({...modal,kategoria:e.target.value})} style={styles.select}>
+                    {KATEGORIAK.map(k=><option key={k.id} value={k.id}>{k.ikon} {k.nev}</option>)}
+                  </select>
+                </label>
+                <label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Állapot</span>
+                  <select disabled={!canEdit} value={modal.allapot} onChange={e=>setModal({...modal,allapot:e.target.value})} style={styles.select}>
+                    <option value="megerosit">Megerősített</option><option value="elozetes">Előzetes</option>
+                  </select>
+                </label>
+              </div>
+
+              <KollegaValaszto kollegak={kollegak} kivalasztott={modal.kollegaIds} olvas={!canEdit} onValt={(ids)=>setModal({...modal,kollegaIds:ids})}/>
+
+              {utkozesek.length>0 && (
+                <div style={styles.utkozesBanner}>
+                  ⚠️ Időpont-ütközés: {utkozesek.slice(0,4).map((u,i)=>`${u.nev} (${u.cim})`).join(", ")}{utkozesek.length>4?"…":""}
+                </div>
+              )}
+
+              <div style={styles.mezoCsoport}>
+                <div style={styles.mezo}><span style={{...styles.mezoCimke,width:"auto",flex:1}}>Egész napos</span>
+                  <Switch on={modal.egeszNapos} onClick={()=>canEdit&&setModal({...modal,egeszNapos:!modal.egeszNapos})}/></div>
+              </div>
+
+              <div style={styles.mezoCsoport}>
+                <label style={styles.mezo}><span style={styles.mezoCimke}>Kezdő nap</span>
+                  <input type="date" disabled={!canEdit} value={modal.datum} onChange={e=>{const d=e.target.value;setModal(m=>({...m,datum:d,vegDatum:m.vegDatum<d?d:m.vegDatum}));}} style={styles.input}/></label>
+                {!modal.egeszNapos&&<label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Kezdés</span>
+                  <input type="time" disabled={!canEdit} value={modal.kezdo} onChange={e=>setModal({...modal,kezdo:e.target.value})} style={styles.input}/></label>}
+                <label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Záró nap</span>
+                  <input type="date" disabled={!canEdit} value={modal.vegDatum} min={modal.datum} onChange={e=>{const d=e.target.value;setModal(m=>({...m,vegDatum:d<m.datum?m.datum:d}));}} style={styles.input}/></label>
+                {!modal.egeszNapos&&<label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Vége</span>
+                  <input type="time" disabled={!canEdit} value={modal.veg} onChange={e=>setModal({...modal,veg:e.target.value})} style={styles.input}/></label>}
+              </div>
+
+              {/* Ismétlés */}
+              <div style={styles.mezoCsoport}>
+                <label style={styles.mezo}><span style={styles.mezoCimke}>Ismétlés</span>
+                  <select disabled={!canEdit} value={modal.ismetles} onChange={e=>setModal({...modal,ismetles:e.target.value})} style={styles.select}>
+                    <option value="nincs">Nincs</option><option value="nap">Naponta</option><option value="het">Hetente</option><option value="honap">Havonta</option>
+                  </select>
+                </label>
+                {modal.ismetles!=="nincs"&&<label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Ismétlés vége</span>
+                  <input type="date" disabled={!canEdit} value={modal.ismetlesVeg} onChange={e=>setModal({...modal,ismetlesVeg:e.target.value})} style={styles.input}/></label>}
+              </div>
+
+              <div style={styles.mezoCsoport}>
+                <label style={styles.mezo}><span style={styles.mezoCimke}>Helyszín</span>
+                  <input disabled={!canEdit} value={modal.helyszin} onChange={e=>setModal({...modal,helyszin:e.target.value})} placeholder="pl. 3. tárgyaló" style={styles.input}/></label>
+                <label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Online link</span>
+                  <input disabled={!canEdit} value={modal.link} onChange={e=>setModal({...modal,link:e.target.value})} placeholder="Teams / Zoom URL" style={styles.input}/></label>
+              </div>
+
+              {modal.link && <a href={modal.link} target="_blank" rel="noreferrer" style={styles.linkGomb}>🔗 Online hivatkozás megnyitása</a>}
+
+              <div style={styles.mezoCsoport}>
+                <label style={{...styles.mezo,alignItems:"flex-start"}}><span style={{...styles.mezoCimke,paddingTop:4}}>Megjegyzés</span>
+                  <textarea disabled={!canEdit} value={modal.megjegyzes} onChange={e=>setModal({...modal,megjegyzes:e.target.value})} placeholder="Részletek…" rows={3} style={{...styles.input,resize:"none",fontFamily:"inherit"}}/></label>
+              </div>
+
+              <Ertesites esemeny={modal} kollegak={kollegak}/>
+
+              {modal.modositotta && (
+                <div style={styles.meta}>Létrehozta: {kollegak.find(k=>k.id===modal.letrehozta)?.nev||"—"} · Módosítva: {kollegak.find(k=>k.id===modal.modositotta)?.nev||"—"}{modal.modositva?` (${modal.modositva})`:""}</div>
+              )}
+
+              {modal.id&&canEdit&&<button onClick={torolModal} style={styles.torolGomb}>Esemény törlése</button>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {kollegaPanel && <KollegaPanel kollegak={kollegak} onMentes={mentKollegak} onBezar={()=>setKollegaPanel(false)}/>}
+
+      {beallitasok && (
+        <Beallitasok kollegak={kollegak} enId={enId} onEnId={valtEnId} temaSotet={temaSotet} onTema={valtTema}
+          onIcs={osszesIcs} onCsv={csvExport} digestLink={napiDigestLink()} onNyomtat={()=>window.print()} onBezar={()=>setBeallitasok(false)}/>
+      )}
+    </div>
+  );
+}
+
+/* ===================== Beállítások panel ===================== */
+function Beallitasok({kollegak,enId,onEnId,temaSotet,onTema,onIcs,onCsv,digestLink,onNyomtat,onBezar}){
+  return (
+    <div style={styles.overlay} onClick={onBezar}>
+      <div style={styles.lap} onClick={e=>e.stopPropagation()}>
+        <div style={styles.lapFej}><button onClick={onBezar} style={styles.lapMegse}>Kész</button><span style={styles.lapCim}>Beállítások</span><span style={{width:48}} /></div>
+        <div style={styles.lapTorzs}>
+          <div style={styles.mezoCsoport}>
+            <label style={styles.mezo}><span style={{...styles.mezoCimke,width:90}}>Ki vagy te?</span>
+              <select value={enId} onChange={e=>onEnId(e.target.value)} style={styles.select}>
+                <option value="">— válassz —</option>
+                {kollegak.map(k=><option key={k.id} value={k.id}>{k.nev}{k.szerep==="nezo"?" (néző)":""}</option>)}
+              </select>
+            </label>
+          </div>
+          <div style={styles.mezoCsoport}>
+            <div style={styles.mezo}><span style={{...styles.mezoCimke,width:"auto",flex:1}}>Sötét mód</span><Switch on={temaSotet} onClick={onTema}/></div>
+          </div>
+          <div style={styles.mezoCsoport}>
+            <a href={digestLink} style={styles.menuGomb}>📧 Mai program kiküldése e-mailben</a>
+            <button onClick={onIcs} style={{...styles.menuGomb,borderTop:"1px solid var(--line)"}}>📅 Teljes naptár exportálása (.ics)</button>
+            <button onClick={onCsv} style={{...styles.menuGomb,borderTop:"1px solid var(--line)"}}>📄 Exportálás táblázatba (.csv)</button>
+            <button onClick={onNyomtat} style={{...styles.menuGomb,borderTop:"1px solid var(--line)"}}>🖨️ Nyomtatás</button>
+          </div>
+          <p style={{fontSize:12,color:"#8E8E93",lineHeight:1.5}}>
+            A „ki vagy te?" és a sötét mód csak ezen az eszközön érvényes. Az események és kollégák megosztottak.
+            Az .ics fájlt bárki importálhatja a saját naptárába (Google/Outlook), és onnantól automatikusan emlékeztet.
+          </p>
+          <div style={{textAlign:"center",fontSize:11,color:"#C7C7CC",marginTop:8}}>{APP_NEV} {VERZIO}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ===================== Értesítés gombok ===================== */
+function Ertesites({esemeny,kollegak}){
+  const emailek=esemenyEmailek(esemeny,kollegak); const vanEmail=emailek.length>0;
+  return (
+    <div style={styles.mezoCsoport}>
+      <a href={vanEmail?mailtoLink(esemeny,kollegak):undefined} onClick={vanEmail?undefined:(e)=>e.preventDefault()}
+        style={{...styles.ertesitesGomb, ...(vanEmail?{}:{opacity:0.4,cursor:"default"})}}>
+        <span>✉️ Emlékeztető e-mailben</span><span style={{fontSize:13,color:"#8E8E93"}}>{vanEmail?`${emailek.length} címzett`:"nincs e-mail cím"}</span>
+      </a>
+      <button onClick={()=>icsLetoltesEgy(esemeny,kollegak)} style={{...styles.ertesitesGomb,borderTop:"1px solid var(--line)"}}>
+        <span>📅 Naptár-meghívó (.ics)</span><span style={{fontSize:13,color:"#8E8E93"}}>automata emlékeztető</span>
+      </button>
+    </div>
+  );
+}
+
+/* ===================== Több kolléga választó ===================== */
+function KollegaValaszto({kollegak,kivalasztott,onValt,olvas}){
+  const [nyitva,setNyitva]=useState(false);
+  const valt=(id)=>!olvas&&onValt(kivalasztott.includes(id)?kivalasztott.filter(x=>x!==id):[...kivalasztott,id]);
+  const nevek=kivalasztott.map(id=>kollegak.find(k=>k.id===id)).filter(Boolean);
+  return (
+    <div style={styles.mezoCsoport}>
+      <button onClick={()=>setNyitva(n=>!n)} style={{...styles.mezo,width:"100%",background:"none",border:"none",cursor:"pointer",textAlign:"left"}}>
+        <span style={styles.mezoCimke}>Kollégák</span>
+        <span style={{flex:1,fontSize:15,color:nevek.length?"var(--txt)":"#C7C7CC",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
+          {nevek.length?nevek.map((k,i)=><span key={k.id} style={{color:szinHex(k.szin),fontWeight:600}}>{k.nev}{i<nevek.length-1?", ":""}</span>):"Válassz egy vagy több kollégát"}
+        </span>
+        <span style={{color:"#C7C7CC",marginLeft:6,transform:nyitva?"rotate(90deg)":"none",transition:"transform .15s"}}>›</span>
+      </button>
+      {nyitva&&(
+        <div style={{borderTop:"1px solid var(--line)"}}>
+          {kollegak.length===0&&<div style={{padding:"12px 14px",color:"#8E8E93",fontSize:14}}>Nincs kolléga.</div>}
+          {kollegak.map(k=>{ const be=kivalasztott.includes(k.id); return (
+            <button key={k.id} onClick={()=>valt(k.id)} style={styles.checkSor}>
+              <span style={{width:10,height:10,borderRadius:10,background:szinHex(k.szin),flexShrink:0}} />
+              <span style={{flex:1,fontSize:15,color:"var(--txt)"}}>{k.nev}{k.csapat?<span style={{color:"#8E8E93",fontSize:13}}> · {k.csapat}</span>:null}</span>
+              <span style={{color:"#34C759",fontSize:18,fontWeight:700,opacity:be?1:0}}>✓</span>
+            </button> ); })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===================== iOS kapcsoló ===================== */
+function Switch({on,onClick}){
+  return (
+    <button onClick={onClick} aria-pressed={on}
+      style={{width:51,height:31,borderRadius:31,background:on?"#34C759":"#E5E5EA",border:"none",position:"relative",cursor:"pointer",transition:"background .2s",flexShrink:0,padding:0}}>
+      <span style={{position:"absolute",top:2,left:on?22:2,width:27,height:27,borderRadius:27,background:"#fff",boxShadow:"0 1px 3px rgba(0,0,0,.3)",transition:"left .2s"}} />
+    </button>
+  );
+}
+
+/* ===================== Kolléga kezelő ===================== */
+function KollegaPanel({kollegak,onMentes,onBezar}){
+  const [lista,setLista]=useState(kollegak.map(k=>({email:"",csapat:"",szerep:"szerkeszto",...k})));
+  const [ujNev,setUjNev]=useState("");
+  const hasznalt=lista.map(k=>k.szin); const kov=SZINEK.find(s=>!hasznalt.includes(s.id))?.id||SZINEK[0].id;
+  const hozzaad=()=>{ if(!ujNev.trim())return; setLista([...lista,{id:ujId(),nev:ujNev.trim(),szin:kov,email:"",csapat:"",szerep:"szerkeszto"}]); setUjNev(""); };
+  const torol=(id)=>setLista(lista.filter(k=>k.id!==id));
+  const valt=(id,m,v)=>setLista(lista.map(k=>k.id===id?{...k,[m]:v}:k));
+  return (
+    <div style={styles.overlay} onClick={onBezar}>
+      <div style={styles.lap} onClick={e=>e.stopPropagation()}>
+        <div style={styles.lapFej}><button onClick={onBezar} style={styles.lapMegse}>Mégse</button><span style={styles.lapCim}>Kollégák</span>
+          <button onClick={()=>{onMentes(lista);onBezar();}} style={{...styles.lapKesz,opacity:1}}>Kész</button></div>
+        <div style={styles.lapTorzs}>
+          {lista.map(k=>(
+            <div key={k.id} style={styles.kollegaKartya}>
+              <div style={styles.kollegaFejlec}>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  {SZINEK.map(s=><button key={s.id} onClick={()=>valt(k.id,"szin",s.id)} aria-label={s.nev}
+                    style={{width:18,height:18,borderRadius:18,background:s.hex,border:k.szin===s.id?"2px solid var(--txt)":"2px solid transparent",cursor:"pointer",padding:0}}/>)}
+                </div>
+                <button onClick={()=>torol(k.id)} style={styles.miniTorol} aria-label="Törlés">✕</button>
+              </div>
+              <input value={k.nev} onChange={e=>valt(k.id,"nev",e.target.value)} placeholder="Név" style={{...styles.kartyaInput,fontWeight:600,color:szinHex(k.szin)}}/>
+              <input value={k.email||""} onChange={e=>valt(k.id,"email",e.target.value)} type="email" placeholder="E-mail cím (opcionális)"
+                style={{...styles.kartyaInput,color:k.email&&!ervenyesEmail(k.email)?"#FF3B30":"var(--txt)"}}/>
+              <div style={{display:"flex",gap:10}}>
+                <input value={k.csapat||""} onChange={e=>valt(k.id,"csapat",e.target.value)} placeholder="Csapat / részleg" style={{...styles.kartyaInput,flex:1}}/>
+                <select value={k.szerep||"szerkeszto"} onChange={e=>valt(k.id,"szerep",e.target.value)} style={{...styles.kartyaInput,flex:1}}>
+                  {SZEREPEK.map(s=><option key={s.id} value={s.id}>{s.nev}</option>)}
+                </select>
+              </div>
+            </div>
+          ))}
+          <div style={{...styles.mezoCsoport,marginTop:4}}>
+            <div style={{display:"flex",gap:8,alignItems:"center",padding:"4px 8px"}}>
+              <input value={ujNev} onChange={e=>setUjNev(e.target.value)} onKeyDown={e=>e.key==="Enter"&&hozzaad()} placeholder="Új kolléga neve" style={styles.input}/>
+              <button onClick={hozzaad} style={styles.hozzaadGomb}>Hozzáad</button>
+            </div>
+          </div>
+          <p style={{fontSize:12,color:"#8E8E93",marginTop:14,lineHeight:1.5}}>
+            A szerepkör jelenleg lágy jogosultság (a „Néző" nem szerkeszt). Valódi, biztonságos belépéshez háttérrendszer kell.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ===================== Stílusok ===================== */
+const FONT="-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif";
+const styles={
+  app:{ fontFamily:FONT, background:"var(--bg)", minHeight:"100vh", color:"var(--txt)", maxWidth:560, margin:"0 auto", display:"flex", flexDirection:"column" },
+  fejlec:{ background:"var(--card)", position:"sticky", top:0, zIndex:10, borderBottom:"1px solid var(--line)" },
+  appSor:{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"8px 12px 2px" },
+  appIkon:{ background:"none", border:"none", fontSize:17, cursor:"pointer", width:30 },
+  appCim:{ textAlign:"center", fontSize:12, fontWeight:700, letterSpacing:"0.6px", textTransform:"uppercase", color:"#8E8E93" },
+  keresoInput:{ width:"100%", boxSizing:"border-box", background:"var(--bg)", border:"none", borderRadius:10, padding:"10px 36px 10px 12px", fontSize:15, color:"var(--txt)", outline:"none" },
+  keresoTorol:{ position:"absolute", right:8, top:"50%", transform:"translateY(-50%)", background:"var(--faint)", border:"none", borderRadius:20, width:20, height:20, color:"var(--card)", fontSize:11, lineHeight:1, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", padding:0 },
+  fejlecFelso:{ display:"flex", alignItems:"center", gap:4, padding:"4px 14px 8px" },
+  honapCim:{ fontSize:21, fontWeight:700, margin:0, letterSpacing:"-0.4px", whiteSpace:"nowrap" },
+  chevron:{ background:"none", border:"none", fontSize:27, color:"#FF3B30", cursor:"pointer", lineHeight:1, padding:"0 3px", fontWeight:300 },
+  maGomb:{ background:"none", border:"none", color:"#FF3B30", fontSize:15, fontWeight:600, cursor:"pointer", padding:"6px 6px" },
+  ikonGomb:{ background:"var(--bg)", border:"none", borderRadius:10, width:32, height:32, fontSize:15, cursor:"pointer" },
+  plusGomb:{ background:"#FF3B30", border:"none", borderRadius:10, width:32, height:32, color:"#fff", fontSize:19, cursor:"pointer", lineHeight:1 },
+  szegmens:{ display:"flex", gap:2, background:"var(--bg)", borderRadius:9, padding:2, margin:"0 14px 8px" },
+  szegmensGomb:{ flex:1, border:"none", background:"none", padding:"6px 0", fontSize:14, fontWeight:600, color:"var(--txt)", borderRadius:7, cursor:"pointer" },
+  szegmensAktiv:{ background:"var(--card)", boxShadow:"0 1px 3px rgba(0,0,0,.12)" },
+  szuroSor:{ display:"flex", gap:8, padding:"0 14px 10px", overflowX:"auto", whiteSpace:"nowrap", alignItems:"center" },
+  csapatSelect:{ border:"1px solid var(--line)", background:"var(--card)", color:"var(--txt)", borderRadius:16, padding:"5px 10px", fontSize:13, flexShrink:0 },
+  chip:{ display:"inline-flex", alignItems:"center", border:"1px solid var(--line)", background:"var(--card)", color:"var(--txt)", borderRadius:16, padding:"5px 12px", fontSize:13, fontWeight:500, cursor:"pointer", flexShrink:0 },
+  chipAktiv:{ background:"var(--txt)", color:"var(--bg)", borderColor:"var(--txt)" },
+  hetSor:{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", padding:"2px 6px 8px" },
+  hetNap:{ textAlign:"center", fontSize:12, fontWeight:600 },
+  racsKeret:{ background:"var(--card)", overflow:"hidden", borderBottom:"8px solid var(--bg)" },
+  racs:{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", background:"var(--card)", padding:"4px 6px 10px" },
+  cellaGomb:{ background:"none", border:"none", cursor:"pointer", padding:"4px 0 2px", display:"flex", flexDirection:"column", alignItems:"center", gap:3, minHeight:50 },
+  napSzam:{ width:30, height:30, lineHeight:"30px", borderRadius:30, fontSize:16, fontWeight:500, textAlign:"center" },
+  pontSor:{ display:"flex", gap:2, height:6, alignItems:"center" },
+  agenda:{ flex:1, padding:"8px 0 30px" },
+  agendaFej:{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", padding:"12px 18px 6px" },
+  agendaDatum:{ fontSize:17, fontWeight:700, letterSpacing:"-0.3px" },
+  agendaPlus:{ background:"none", border:"none", color:"#FF3B30", fontWeight:600, fontSize:15, cursor:"pointer", whiteSpace:"nowrap" },
+  jelenletSav:{ padding:"4px 16px 10px", borderBottom:"1px solid var(--line)" },
+  jelenletCim:{ fontSize:12, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.5px", color:"#8E8E93", marginBottom:6 },
+  jelenletLista:{ display:"flex", gap:8, overflowX:"auto", whiteSpace:"nowrap" },
+  jelenletElem:{ display:"inline-flex", alignItems:"center", gap:4, background:"var(--card)", border:"1px solid var(--line)", borderRadius:14, padding:"4px 10px", fontSize:13, flexShrink:0 },
+  ures:{ textAlign:"center", color:"#8E8E93", fontSize:15, padding:"34px 20px" },
+  esemenySor:{ display:"flex", gap:12, alignItems:"stretch", width:"100%", background:"var(--card)", border:"none", borderBottom:"1px solid var(--line)", padding:"12px 16px", cursor:"pointer", textAlign:"left" },
+  ido:{ fontSize:14, fontWeight:600, color:"var(--txt)" },
+  idoVeg:{ fontSize:13, color:"#8E8E93" },
+  esemenyCim:{ fontSize:16, fontWeight:600, color:"var(--txt)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" },
+  esemenyMeta:{ fontSize:13, marginTop:2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" },
+  tartomany:{ fontSize:12, color:"#8E8E93", marginTop:2 },
+  hetNapFej:{ display:"block", width:"100%", textAlign:"left", background:"var(--bg)", border:"none", borderTop:"1px solid var(--line)", padding:"8px 16px", fontSize:14, color:"var(--txt)", cursor:"pointer" },
+  hetUres:{ padding:"8px 16px", color:"#C7C7CC", fontSize:14 },
+  talalatDatum:{ padding:"6px 16px 0", fontSize:12, fontWeight:700, color:"#8E8E93" },
+  overlay:{ position:"fixed", inset:0, background:"rgba(0,0,0,0.4)", display:"flex", alignItems:"flex-end", justifyContent:"center", zIndex:50 },
+  lap:{ background:"var(--bg)", width:"100%", maxWidth:560, borderTopLeftRadius:16, borderTopRightRadius:16, maxHeight:"92vh", overflowY:"auto", animation:"fel .25s ease" },
+  lapFej:{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 16px", position:"sticky", top:0, background:"var(--bg)", borderBottom:"1px solid var(--line)", zIndex:2 },
+  lapMegse:{ background:"none", border:"none", color:"#FF3B30", fontSize:16, cursor:"pointer", minWidth:48, textAlign:"left" },
+  lapCim:{ fontSize:16, fontWeight:700 },
+  lapKesz:{ background:"none", border:"none", color:"#FF3B30", fontSize:16, fontWeight:700, cursor:"pointer", minWidth:48, textAlign:"right" },
+  lapTorzs:{ padding:16 },
+  olvasBanner:{ background:"#FFF3CD", color:"#7A5C00", borderRadius:10, padding:"10px 12px", fontSize:13, marginBottom:14 },
+  utkozesBanner:{ background:"#FFF3CD", color:"#7A5C00", borderRadius:10, padding:"10px 12px", fontSize:13, marginBottom:16, marginTop:-6 },
+  cimInput:{ width:"100%", boxSizing:"border-box", background:"var(--card)", border:"none", borderRadius:12, padding:"14px", fontSize:18, fontWeight:600, marginBottom:16, outline:"none", color:"var(--txt)" },
+  mezoCsoport:{ background:"var(--card)", borderRadius:12, overflow:"hidden", marginBottom:16 },
+  mezo:{ display:"flex", alignItems:"center", padding:"0 14px", minHeight:48, boxSizing:"border-box" },
+  mezoElvalaszto:{ borderTop:"1px solid var(--line)" },
+  mezoCimke:{ width:80, fontSize:15, color:"var(--txt)", flexShrink:0 },
+  input:{ flex:1, border:"none", background:"transparent", fontSize:15, outline:"none", padding:"12px 0", color:"var(--txt)", width:"100%" },
+  select:{ flex:1, border:"none", background:"transparent", fontSize:15, outline:"none", padding:"12px 0", color:"var(--txt)", cursor:"pointer" },
+  checkSor:{ display:"flex", alignItems:"center", gap:10, width:"100%", background:"none", border:"none", borderTop:"1px solid var(--bg)", padding:"12px 14px", cursor:"pointer", textAlign:"left" },
+  ertesitesGomb:{ display:"flex", alignItems:"center", justifyContent:"space-between", width:"100%", background:"var(--card)", border:"none", padding:"14px", fontSize:15, fontWeight:600, color:"#007AFF", cursor:"pointer", textDecoration:"none", boxSizing:"border-box" },
+  menuGomb:{ display:"block", width:"100%", textAlign:"left", background:"var(--card)", border:"none", padding:"14px", fontSize:15, fontWeight:600, color:"#007AFF", cursor:"pointer", textDecoration:"none", boxSizing:"border-box" },
+  linkGomb:{ display:"block", textAlign:"center", background:"var(--card)", borderRadius:12, padding:"12px", fontSize:15, fontWeight:600, color:"#007AFF", textDecoration:"none", marginBottom:16 },
+  meta:{ fontSize:12, color:"#8E8E93", padding:"0 4px 12px" },
+  torolGomb:{ width:"100%", background:"var(--card)", border:"none", borderRadius:12, padding:"14px", color:"#FF3B30", fontSize:16, fontWeight:600, cursor:"pointer", marginTop:4 },
+  kollegaKartya:{ background:"var(--card)", borderRadius:12, padding:"12px 14px", marginBottom:10 },
+  kollegaFejlec:{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 },
+  kartyaInput:{ width:"100%", boxSizing:"border-box", border:"none", borderBottom:"1px solid var(--line)", background:"transparent", fontSize:15, outline:"none", padding:"8px 0", color:"var(--txt)" },
+  miniTorol:{ background:"var(--bg)", border:"none", borderRadius:16, width:26, height:26, color:"#8E8E93", cursor:"pointer", fontSize:13, flexShrink:0 },
+  hozzaadGomb:{ background:"#FF3B30", border:"none", borderRadius:10, color:"#fff", fontWeight:600, padding:"10px 16px", cursor:"pointer", flexShrink:0 },
+  verzio:{ textAlign:"center", fontSize:11, color:"#C7C7CC", padding:"4px 0 22px", letterSpacing:"0.3px" },
+};
+
+const css=`
+  :root{ --bg:#F2F2F7; --card:#FFFFFF; --txt:#1C1C1E; --line:#E5E5EA; --faint:#C7C7CC; }
+  .sotet{ --bg:#000000; --card:#1C1C1E; --txt:#FFFFFF; --line:#38383A; --faint:#5A5A5E; }
+  * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+  @keyframes fel { from { transform: translateY(100%);} to { transform: translateY(0);} }
+  @keyframes beJobbrol { from { transform: translateX(38px); opacity:.35 } to { transform: translateX(0); opacity:1 } }
+  @keyframes beBalrol { from { transform: translateX(-38px); opacity:.35 } to { transform: translateX(0); opacity:1 } }
+  button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid #007AFF; outline-offset: 2px; }
+  input:disabled, select:disabled, textarea:disabled { opacity: 1; -webkit-text-fill-color: var(--txt); }
+  select option { color:#000; }
+  ::-webkit-scrollbar { height:0; width:0; }
+  @media print { header, footer, .nyomtatasRejt { display:none !important; } }
+`;
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
