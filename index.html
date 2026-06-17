@@ -8,13 +8,13 @@
 <style>html,body{margin:0;padding:0;background:#F2F2F7;} #root{min-height:100vh;}</style>
 <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
 </head>
 <body>
 <div id="root">Betöltés…</div>
-<script type="text/babel" data-presets="react">
 
-  // --- Tárolás shim: a Claude window.storage helyett localStorage (eszközönként) ---
+<script type="text/plain" id="appsrc">
+
   window.storage = {
     async get(key, shared){ try{ const v=localStorage.getItem("t7:"+key); return v?{key,value:v,shared}:null; }catch(e){ return null; } },
     async set(key, value, shared){ try{ localStorage.setItem("t7:"+key, value); }catch(e){} return {key,value,shared}; },
@@ -839,6 +839,24 @@ const css=`
 
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+<script>
+(function(){
+  function show(cim,msg){
+    var r=document.getElementById("root");
+    if(r) r.innerHTML="<pre style="white-space:pre-wrap;padding:16px;margin:0;color:#b00020;font:13px ui-monospace,Menlo,monospace">"+cim+"\n"+String(msg).replace(/&/g,"&amp;").replace(/</g,"&lt;")+"</pre>";
+  }
+  window.onerror=function(m,s,l,c){ show("⚠️ Futási hiba", m+"  ("+l+":"+c+")"); };
+  window.addEventListener("unhandledrejection",function(e){ show("⚠️ Async hiba", (e.reason&&e.reason.message)||e.reason); });
+  if(typeof React==="undefined"||typeof ReactDOM==="undefined"){ show("⚠️ A React nem töltött be","Ellenőrizd az internetkapcsolatot (a React/Babel a CDN-ről jön)."); return; }
+  if(typeof Babel==="undefined"){ show("⚠️ A Babel nem töltött be","Ellenőrizd az internetkapcsolatot."); return; }
+  try{
+    var code=document.getElementById("appsrc").textContent;
+    var out=Babel.transform(code,{presets:["react"]}).code;
+    (new Function(out))();
+  }catch(err){ show("⚠️ Fordítási/futási hiba", (err&&err.stack)||err&&err.message||err); }
+})();
 </script>
 </body>
 </html>
