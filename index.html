@@ -47,7 +47,9 @@ const KATEGORIAK = [
   { id:"kepzes",      nev:"Képzés",      ikon:"📚", tavollet:"tavol" },
   { id:"egyeb",       nev:"Egyéb",       ikon:"📌", tavollet:false },
 ];
-const SZEREPEK = [{id:"admin",nev:"Admin"},{id:"szerkeszto",nev:"Szerkesztő"},{id:"nezo",nev:"Néző"}];
+const SZEREPEK = [{id:"admin",nev:"Admin"},{id:"nezo",nev:"Néző"}];
+/* Régi „szerkeszto" szerep átfordítása nézőre (visszafelé kompatibilitás) */
+const normSzerep = (sz) => sz==="admin" ? "admin" : "nezo";
 
 const KEY_KOLLEGAK = "csapatnaptar:kollegak";
 const KEY_ESEMENYEK = "csapatnaptar:esemenyek";
@@ -55,12 +57,12 @@ const KEY_ENID = "csapatnaptar:enId";   // személyes (nem megosztott)
 const KEY_TEMA = "csapatnaptar:tema";   // személyes
 
 const APP_NEV = "T7 naptár";
-const VERZIO = "v1.0.3";
+const VERZIO = "v1.3.0";
 
 const KEZDO_KOLLEGAK = [
   { id:"k1", nev:"Anna",  szin:"blue",   email:"", csapat:"Értékesítés", szerep:"admin" },
-  { id:"k2", nev:"Béla",  szin:"green",  email:"", csapat:"Fejlesztés",  szerep:"szerkeszto" },
-  { id:"k3", nev:"Csaba", szin:"orange", email:"", csapat:"Fejlesztés",  szerep:"szerkeszto" },
+  { id:"k2", nev:"Béla",  szin:"green",  email:"", csapat:"Fejlesztés",  szerep:"nezo" },
+  { id:"k3", nev:"Csaba", szin:"orange", email:"", csapat:"Fejlesztés",  szerep:"nezo" },
 ];
 
 /* ===================== Segédfüggvények ===================== */
@@ -200,6 +202,65 @@ function App(){
 
   const [slide,setSlide]=useState(0);
   const erint=useRef({x:0,y:0});
+  const swReg=useRef(null);
+  const notifTamogatott = typeof window!=="undefined" && "Notification" in window;
+  const [ertAllapot,setErtAllapot]=useState(notifTamogatott?Notification.permission:"unsupported"); // default|granted|denied|unsupported
+
+  /* Service worker regisztráció (értesítésekhez, főleg Androidon) */
+  useEffect(()=>{
+    if(typeof navigator==="undefined" || !("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.register("./sw.js").then(r=>{ swReg.current=r; }).catch(()=>{});
+  },[]);
+
+  /* Értesítési engedély kérése */
+  const kerErtesites=async()=>{
+    if(!notifTamogatott){ window.alert("Ez a böngésző nem támogatja az értesítéseket."); return; }
+    try{ const p=await Notification.requestPermission(); setErtAllapot(p);
+      if(p==="granted") mutatErtesites("🔔 Értesítések bekapcsolva",{body:"Emlékeztetőt kapsz 48 és 24 órával az eseményeid előtt."});
+    }catch(e){}
+  };
+
+  /* Egy értesítés megjelenítése – service workeren át (Android), különben Notification */
+  const mutatErtesites=(cim,opciok)=>{
+    try{
+      if(swReg.current && swReg.current.showNotification){ swReg.current.showNotification(cim,opciok); return; }
+      if(navigator.serviceWorker && navigator.serviceWorker.controller){ navigator.serviceWorker.controller.postMessage({type:"notify",title:cim,options:opciok}); return; }
+      new Notification(cim,opciok);
+    }catch(e){}
+  };
+
+  /* Emlékeztetők ütemezése: 48h és 24h az esemény kezdete előtt, a megjelölt embernek.
+     Megjegyzés: kliensoldali – akkor is „bepótolja", ha közben megnyílt az app;
+     garantált kézbesítés zárt appnál Web Push + szerver kellene. */
+  useEffect(()=>{
+    if(!notifTamogatott || ertAllapot!=="granted" || !enId) return;
+    const mar=(k)=>{ try{ return !!localStorage.getItem("t7:notif:"+k); }catch(e){ return false; } };
+    const jelol=(k)=>{ try{ localStorage.setItem("t7:notif:"+k,"1"); }catch(e){} };
+    const ellenoriz=()=>{
+      const most=Date.now();
+      esemenyek.forEach(e=>{
+        if(!Array.isArray(e.kollegaIds)||!e.kollegaIds.includes(enId)) return;
+        if(e.ismetles && e.ismetles!=="nincs") return; // ismétlődőt egyelőre kihagyjuk
+        const ido=e.egeszNapos?"09:00":(e.kezdo||"09:00");
+        const start=new Date(`${e.datum}T${ido}:00`).getTime();
+        if(isNaN(start)) return;
+        [48,24].forEach(h=>{
+          const mark=start-h*3600000; const k=`${e.id}:${h}`;
+          if(most>=mark && most<start && !mar(k)){
+            const mikor=h===48?"2 nap múlva":"holnap (24 órán belül)";
+            mutatErtesites(`${kat(e.kategoria).ikon} ${e.cim||"Esemény"} – ${mikor}`,
+              {body:`${idopontSzoveg(e)}${e.helyszin?"\n📍 "+e.helyszin:""}`, tag:`t7-${k}`, renotify:false});
+            jelol(k);
+          }
+        });
+      });
+    };
+    ellenoriz();
+    const id=setInterval(ellenoriz,60000);
+    const onVis=()=>{ if(document.visibilityState==="visible") ellenoriz(); };
+    document.addEventListener("visibilitychange",onVis);
+    return ()=>{ clearInterval(id); document.removeEventListener("visibilitychange",onVis); };
+  },[esemenyek,enId,ertAllapot,notifTamogatott]);
 
   useEffect(()=>{(async()=>{
     const k=await betolt(KEY_KOLLEGAK,null);
@@ -207,7 +268,7 @@ function App(){
     const id=await betolt(KEY_ENID,"",false);
     const t=await betolt(KEY_TEMA,false,false);
     if(k===null){ await ment(KEY_KOLLEGAK,KEZDO_KOLLEGAK); setKollegak(KEZDO_KOLLEGAK); }
-    else setKollegak(k.map(x=>({email:"",csapat:"",szerep:"szerkeszto",...x})));
+    else setKollegak(k.map(x=>{ const y={email:"",csapat:"",szerep:"nezo",...x}; y.szerep=normSzerep(y.szerep); return y; }));
     setEsemenyek((Array.isArray(e)?e:[]).map(normalizal));
     setEnId(id||""); setTemaSotet(!!t);
     setBetoltodik(false);
@@ -219,7 +280,14 @@ function App(){
   const valtEnId=(id)=>{ setEnId(id); ment(KEY_ENID,id,false); };
 
   const enKollega = kollegak.find(k=>k.id===enId) || null;
-  const canEdit = !enKollega || enKollega.szerep!=="nezo";
+  // Ha nincs kiválasztva „ki vagy te?", adminként kezeljük (kezdeti beállításhoz)
+  const isAdmin = !enKollega || enKollega.szerep==="admin";
+  const isNezo = !!enKollega && enKollega.szerep==="nezo";
+  // Bárki hozhat létre eseményt; a néző csak sajátot (lásd modalSzerk)
+  const canEdit = isAdmin || isNezo;
+  // Egy adott esemény szerkeszthető-e általam
+  const esemenySajat = (e) => !!enId && Array.isArray(e.kollegaIds) && e.kollegaIds.length>0 && e.kollegaIds.every(id=>id===enId);
+  const esemenySzerk = (e) => isAdmin || (isNezo && (e.id==null || esemenySajat(e)));
   const csapatok = useMemo(()=>[...new Set(kollegak.map(k=>k.csapat).filter(Boolean))],[kollegak]);
 
   const napok=useMemo(()=>honapNapjai(megjelenitettHonap.getFullYear(),megjelenitettHonap.getMonth()),[megjelenitettHonap]);
@@ -234,20 +302,22 @@ function App(){
     .sort((a,b)=>a.egeszNapos!==b.egeszNapos?(a.egeszNapos?-1:1):(a.kezdo||"").localeCompare(b.kezdo||"")),[esemenyek,lathato]);
 
   const kollegaSzin=(id)=>{ const k=kollegak.find(x=>x.id===id); return k?szinHex(k.szin):"#C7C7CC"; };
-  const esemenySzinek=(e)=> e.kollegaIds.length?e.kollegaIds.map(kollegaSzin):["#C7C7CC"];
+  const esemenySzinek=(e)=> e.kollegaIds.length?e.kollegaIds.map(kollegaSzin):["#8E8E93"];
 
-  /* Jelenlét egy kollégára adott napon */
+  /* Jelenlét egy kollégára adott napon (alapból „Elérhető") */
   const jelenlet=(kollegaId,d)=>{
     const tav=esemenyek.filter(e=>e.kollegaIds.includes(kollegaId)&&elofordul(e,d)).map(e=>kat(e.kategoria)).filter(k=>k.tavollet);
-    if(!tav.length) return {ikon:"🏢",cimke:"Irodában"};
+    if(!tav.length) return {ikon:"🟢",cimke:"Elérhető"};
     const ho=tav.find(k=>k.tavollet==="ho"); const tavol=tav.find(k=>k.tavollet==="tavol");
     if(tavol) return {ikon:tavol.ikon,cimke:tavol.nev};
     if(ho) return {ikon:"🏠",cimke:"Home office"};
-    return {ikon:"🏢",cimke:"Irodában"};
+    return {ikon:"🟢",cimke:"Elérhető"};
   };
 
   /* Navigáció */
   const lepHonap=(i)=>{ setSlide(i); setMegjelenitettHonap(d=>new Date(d.getFullYear(),d.getMonth()+i,1)); };
+  const lepHet=(i)=>{ const d=new Date(hetKezdet(kivalasztottNap)); d.setDate(d.getDate()+i*7); setKivalasztottNap(d); setMegjelenitettHonap(new Date(d.getFullYear(),d.getMonth(),1)); };
+  const lepNap=(i)=>{ const d=new Date(kivalasztottNap); d.setDate(d.getDate()+i); setKivalasztottNap(d); setMegjelenitettHonap(new Date(d.getFullYear(),d.getMonth(),1)); };
   const ugrasMa=()=>{ setSlide(0); const m=new Date(); setMegjelenitettHonap(new Date(m.getFullYear(),m.getMonth(),1)); setKivalasztottNap(new Date(m.getFullYear(),m.getMonth(),m.getDate())); };
   const erintKezd=(e)=>{ const t=e.touches[0]; erint.current={x:t.clientX,y:t.clientY}; };
   const erintVeg=(e)=>{ const t=e.changedTouches[0]; const dx=t.clientX-erint.current.x, dy=t.clientY-erint.current.y;
@@ -255,31 +325,47 @@ function App(){
 
   /* Modal */
   const ujEsemeny=()=>{ if(!canEdit) return; setModal({
-    id:null,cim:"",kollegaIds:[],kategoria:"megbeszeles",allapot:"megerosit",egeszNapos:false,
+    id:null,cim:"",kollegaIds:(isNezo&&enId)?[enId]:[],kategoria:"megbeszeles",allapot:"megerosit",egeszNapos:false,
     datum:ymd(kivalasztottNap),vegDatum:ymd(kivalasztottNap),kezdo:"09:00",veg:"10:00",
     helyszin:"",link:"",megjegyzes:"",ismetles:"nincs",ismetlesVeg:"",
   }); };
   const nyitEsemeny=(e)=> setModal({...e,kollegaIds:[...e.kollegaIds]});
 
   const mentModal=()=>{
-    if(!modal.cim.trim()||!canEdit) return;
+    if(!modal.cim.trim()||!esemenySzerk(modal)) return;
     const most=new Date().toISOString().slice(0,16).replace("T"," ");
     const t={...modal}; if(t.vegDatum<t.datum) t.vegDatum=t.datum;
+    if(isNezo && enId) t.kollegaIds=[enId]; // néző csak magát jelölheti
     t.modositotta=enId; t.modositva=most; if(!t.letrehozta) t.letrehozta=enId;
     const uj=t.id?esemenyek.map(e=>e.id===t.id?t:e):[...esemenyek,{...t,id:ujId()}];
     mentEsemenyek(uj); setModal(null);
   };
-  const torolModal=()=>{ if(!canEdit) return; mentEsemenyek(esemenyek.filter(e=>e.id!==modal.id)); setModal(null); };
+  const torolModal=()=>{ if(!esemenySzerk(modal)) return; if(!window.confirm("Biztosan törölni akarod ezt az eseményt? Ez nem vonható vissza.")) return; mentEsemenyek(esemenyek.filter(e=>e.id!==modal.id)); setModal(null); };
 
   /* Ütközések a modal eseményéhez */
   const utkozesek=useMemo(()=>{
     if(!modal) return [];
-    const d=new Date(modal.datum+"T00:00:00"); const lista=[];
-    esemenyek.forEach(e2=>{
-      if(e2.id===modal.id) return; if(!elofordul(e2,d)) return;
-      const kozos=modal.kollegaIds.filter(id=>e2.kollegaIds.includes(id)); if(!kozos.length) return;
-      let utk=true; if(!modal.egeszNapos&&!e2.egeszNapos) utk=(modal.kezdo<e2.veg)&&(e2.kezdo<modal.veg);
-      if(utk) kozos.forEach(id=>lista.push({nev:kollegak.find(k=>k.id===id)?.nev,cim:e2.cim}));
+    // A vizsgálandó napok: nem ismétlődő eseménynél a teljes tartomány, ismétlődőnél a kezdőnap
+    const napok=[];
+    if(!modal.ismetles||modal.ismetles==="nincs"){
+      const start=new Date(modal.datum+"T00:00:00");
+      const end=new Date((modal.vegDatum||modal.datum)+"T00:00:00");
+      for(let d=new Date(start); d<=end; d.setDate(d.getDate()+1)) napok.push(new Date(d));
+    } else {
+      napok.push(new Date(modal.datum+"T00:00:00"));
+    }
+    const latott=new Set(); const lista=[];
+    napok.forEach(d=>{
+      esemenyek.forEach(e2=>{
+        if(e2.id===modal.id) return; if(!elofordul(e2,d)) return;
+        const kozos=modal.kollegaIds.filter(id=>e2.kollegaIds.includes(id)); if(!kozos.length) return;
+        let utk=true; if(!modal.egeszNapos&&!e2.egeszNapos) utk=(modal.kezdo<e2.veg)&&(e2.kezdo<modal.veg);
+        if(!utk) return;
+        kozos.forEach(id=>{
+          const kulcs=id+"|"+e2.id; if(latott.has(kulcs)) return; latott.add(kulcs);
+          lista.push({nev:kollegak.find(k=>k.id===id)?.nev,cim:e2.cim});
+        });
+      });
     });
     return lista;
   },[modal,esemenyek,kollegak]);
@@ -296,6 +382,22 @@ function App(){
   /* Exportok / digest */
   const osszesIcs=()=>letolt(["BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//T7 naptár//HU","CALSCALE:GREGORIAN","METHOD:PUBLISH",
     ...esemenyek.flatMap(e=>veventSorok(e,kollegak)),"END:VCALENDAR"].join("\r\n"),"T7-naptar.ics","text/calendar");
+
+  /* Teljes biztonsági mentés / visszatöltés (JSON) */
+  const jsonExport=()=>letolt(JSON.stringify({app:APP_NEV,verzio:VERZIO,exportalva:new Date().toISOString(),kollegak,esemenyek},null,2),`T7-naptar-mentes-${ymd(new Date())}.json`,"application/json");
+  const jsonImport=(szoveg)=>{
+    try{
+      const adat=JSON.parse(szoveg);
+      if(!adat||typeof adat!=="object") throw new Error("Érvénytelen fájlformátum.");
+      const ujK=Array.isArray(adat.kollegak)?adat.kollegak.map(x=>{ const y={email:"",csapat:"",szerep:"nezo",...x}; y.szerep=normSzerep(y.szerep); return y; }):null;
+      const ujE=Array.isArray(adat.esemenyek)?adat.esemenyek.map(normalizal):null;
+      if(!ujK&&!ujE) throw new Error("A fájl nem tartalmaz kollégákat vagy eseményeket.");
+      if(!window.confirm(`Visszatöltés: ${ujK?ujK.length:0} kolléga és ${ujE?ujE.length:0} esemény. Ez FELÜLÍRJA a jelenlegi adatokat. Folytatod?`)) return;
+      if(ujK) mentKollegak(ujK);
+      if(ujE) mentEsemenyek(ujE);
+      window.alert("Sikeres visszatöltés.");
+    }catch(err){ window.alert("Hiba a visszatöltéskor: "+((err&&err.message)||err)); }
+  };
   const csvExport=()=>{
     const fej=["Cím","Kategória","Kezdő nap","Záró nap","Egész napos","Kezdés","Vége","Helyszín","Link","Kollégák","Állapot","Ismétlés","Megjegyzés"];
     const sorok=esemenyek.map(e=>[e.cim,kat(e.kategoria).nev,e.datum,e.vegDatum,e.egeszNapos?"igen":"nem",e.egeszNapos?"":e.kezdo,e.egeszNapos?"":e.veg,
@@ -356,32 +458,47 @@ function App(){
 
   /* ---- Kiválasztott nap fejléce + jelenlét + események ---- */
   const napFej=(d)=>{
-    const u=unnepNev(d);
+    const u=unnepNev(d); const ma_e=azonosNap(d,ma);
     return (
-      <div style={styles.agendaFej}>
-        <div>
-          <div style={styles.agendaDatum}>{NAPOK_TELJES[hetfoIndex(d)]}, {d.getDate()}. {HONAPOK[d.getMonth()]}</div>
-          {u&&<div style={{fontSize:13,color:"#FF3B30",marginTop:2}}>🇭🇺 {u}</div>}
+      <div style={{...styles.agendaFej,alignItems:"center"}}>
+        <div style={{display:"flex",alignItems:"center",gap:2,minWidth:0}}>
+          {nezet==="nap"&&<button onClick={()=>lepNap(-1)} style={styles.napChevron} aria-label="Előző nap">‹</button>}
+          <div style={{minWidth:0}}>
+            <div style={{...styles.agendaDatum,color:ma_e?"#FF3B30":"var(--txt)"}}>{NAPOK_TELJES[hetfoIndex(d)]}, {d.getDate()}. {HONAPOK[d.getMonth()]}{ma_e?" · Ma":""}</div>
+            {u&&<div style={{fontSize:13,color:"#FF3B30",marginTop:2}}>🇭🇺 {u}</div>}
+          </div>
+          {nezet==="nap"&&<button onClick={()=>lepNap(1)} style={styles.napChevron} aria-label="Következő nap">›</button>}
         </div>
         {canEdit&&<button onClick={ujEsemeny} style={styles.agendaPlus}>＋ Esemény</button>}
       </div>
     );
   };
-  const jelenletSav=(d)=> kollegak.length?(
-    <div style={styles.jelenletSav}>
-      <div style={styles.jelenletCim}>Jelenlét</div>
-      <div style={styles.jelenletLista}>
-        {kollegak.filter(k=>!csapatSzuro||k.csapat===csapatSzuro).map(k=>{ const j=jelenlet(k.id,d); return (
-          <div key={k.id} style={styles.jelenletElem} title={j.cimke}>
-            <span>{j.ikon}</span>
-            <span style={{color:szinHex(k.szin),fontWeight:600}}>{k.nev}</span>
-            <span style={{color:"#8E8E93",fontSize:12}}>{j.cimke}</span>
-          </div> ); })}
+  const jelenletSav=(d)=>{
+    if(!kollegak.length) return null;
+    const hetvege=hetfoIndex(d)>=5;
+    const vanEsemeny=(kid)=>esemenyek.some(e=>e.kollegaIds.includes(kid)&&elofordul(e,d));
+    let lista=kollegak.filter(k=>!csapatSzuro||k.csapat===csapatSzuro);
+    // Hétvégén csak azok látszanak, akik meg vannak jelölve egy adott napi eseményben
+    if(hetvege) lista=lista.filter(k=>vanEsemeny(k.id));
+    if(!lista.length) return null;
+    return (
+      <div style={styles.jelenletSav}>
+        <div style={styles.jelenletCim}>Jelenlét{hetvege?" · hétvége":""}</div>
+        <div style={styles.jelenletLista}>
+          {lista.map(k=>{ const j=jelenlet(k.id,d); return (
+            <div key={k.id} style={styles.jelenletElem} title={j.cimke}>
+              <span>{j.ikon}</span>
+              <span style={{color:szinHex(k.szin),fontWeight:600}}>{k.nev}</span>
+              <span style={{color:"#8E8E93",fontSize:12}}>{j.cimke}</span>
+            </div> ); })}
+        </div>
       </div>
-    </div>
-  ):null;
+    );
+  };
 
   const napEsemenyek=napAgenda(kivalasztottNap);
+  const modalSzerk = modal ? esemenySzerk(modal) : false;   // szerkeszthetem-e a nyitott eseményt
+  const kollegaZarolt = isNezo;                              // néző nem jelölhet más kollégát
 
   return (
     <div className={temaSotet?"app sotet":"app"} style={styles.app}>
@@ -416,7 +533,7 @@ function App(){
           <button onClick={()=>lepHonap(1)} style={styles.chevron} aria-label="Következő hónap">›</button>
           <div style={{flex:1}} />
           <button onClick={ugrasMa} style={styles.maGomb}>Ma</button>
-          <button onClick={()=>setKollegaPanel(true)} style={styles.ikonGomb} aria-label="Kollégák">👥</button>
+          {isAdmin&&<button onClick={()=>setKollegaPanel(true)} style={styles.ikonGomb} aria-label="Kollégák">👥</button>}
           {canEdit&&<button onClick={ujEsemeny} style={styles.plusGomb} aria-label="Új esemény">＋</button>}
         </div>
 
@@ -473,9 +590,11 @@ function App(){
                 lista.forEach(e=>esemenySzinek(e).forEach(h=>{ if(!szinek.includes(h)) szinek.push(h); }));
                 return (
                   <button key={i} onClick={()=>setKivalasztottNap(new Date(d))} style={styles.cellaGomb}>
-                    <div style={{...styles.napSzam, ...(maE?{background:"#FF3B30"}:kiv?{background:"#1C1C1E"}:{}),
-                      color: maE||kiv?"#fff":(!ezAHonap?"var(--faint)":(hetvege||u)?"#FF3B30":"var(--txt)")}}>{d.getDate()}</div>
-                    <div style={styles.pontSor}>{szinek.slice(0,4).map((h,idx)=><span key={idx} style={{width:5,height:5,borderRadius:5,background:h}} />)}</div>
+                    <div style={{...styles.napSzam, ...(maE?{background:"#FF3B30",color:"#fff"}:kiv?{background:"var(--txt)",color:"var(--bg)"}:{color:(!ezAHonap?"var(--faint)":(hetvege||u)?"#FF3B30":"var(--txt)")}), ...(kiv&&!maE?{boxShadow:"0 0 0 2px var(--txt)"}:{})}}>{d.getDate()}</div>
+                    <div style={styles.pontSor}>
+                      {szinek.slice(0,4).map((h,idx)=><span key={idx} style={{width:6,height:6,borderRadius:6,background:h,boxShadow:"0 0 0 0.5px rgba(120,120,128,0.45)"}} />)}
+                      {szinek.length>4&&<span style={{fontSize:9,color:"var(--faint)",lineHeight:"6px"}}>+{szinek.length-4}</span>}
+                    </div>
                   </button>
                 );
               })}
@@ -486,8 +605,12 @@ function App(){
         {/* ===== Tartalom nézet szerint ===== */}
         {nezet==="het" ? (
           <section style={styles.agenda}>
-            <div style={{...styles.agendaFej}}>
-              <div style={styles.agendaDatum}>A hét: {rovidDatum(ymd(hetKezdet(kivalasztottNap)))}</div>
+            <div style={{...styles.agendaFej,alignItems:"center"}}>
+              <div style={{display:"flex",alignItems:"center",gap:2}}>
+                <button onClick={()=>lepHet(-1)} style={styles.napChevron} aria-label="Előző hét">‹</button>
+                <div style={styles.agendaDatum}>{(()=>{ const k=hetKezdet(kivalasztottNap); const v=new Date(k); v.setDate(v.getDate()+6); return `${k.getDate()}. ${HONAPOK[k.getMonth()]} – ${v.getDate()}. ${HONAPOK[v.getMonth()]}`; })()}</div>
+                <button onClick={()=>lepHet(1)} style={styles.napChevron} aria-label="Következő hét">›</button>
+              </div>
               {canEdit&&<button onClick={ujEsemeny} style={styles.agendaPlus}>＋ Esemény</button>}
             </div>
             {Array.from({length:7}).map((_,i)=>{ const d=new Date(hetKezdet(kivalasztottNap)); d.setDate(d.getDate()+i); return renderNapBlokk(d); })}
@@ -508,34 +631,34 @@ function App(){
 
       {/* ===== Esemény modal ===== */}
       {modal && (
-        <div style={styles.overlay} onClick={()=>setModal(null)}>
-          <div style={styles.lap} onClick={e=>e.stopPropagation()}>
+        <div style={styles.overlay}>
+          <div className="sheet" style={styles.lap}>
             <div style={styles.lapFej}>
-              <button onClick={()=>setModal(null)} style={styles.lapMegse}>{canEdit?"Mégse":"Bezár"}</button>
+              <button onClick={()=>setModal(null)} style={styles.lapMegse}>{modalSzerk?"Mégse":"Bezár"}</button>
               <span style={styles.lapCim}>{modal.id?"Esemény":"Új esemény"}</span>
-              {canEdit?<button onClick={mentModal} style={{...styles.lapKesz,opacity:modal.cim.trim()?1:0.4}}>Kész</button>:<span style={{width:48}} />}
+              {modalSzerk?<button onClick={mentModal} style={{...styles.lapKesz,opacity:modal.cim.trim()?1:0.4}}>Kész</button>:<span style={{width:48}} />}
             </div>
             <div style={styles.lapTorzs}>
-              {!canEdit && <div style={styles.olvasBanner}>Csak megtekintés – nincs szerkesztési jogosultságod.</div>}
+              {!modalSzerk && <div style={styles.olvasBanner}>Csak megtekintés – ezt az eseményt csak admin vagy a saját tulajdonosa szerkesztheti.</div>}
 
-              <input autoFocus={canEdit} disabled={!canEdit} value={modal.cim} onChange={e=>setModal({...modal,cim:e.target.value})}
+              <input autoFocus={modalSzerk} disabled={!modalSzerk} value={modal.cim} onChange={e=>setModal({...modal,cim:e.target.value})}
                 placeholder="Cím (pl. Ügyfél-egyeztetés)" style={styles.cimInput}/>
 
               {/* Kategória */}
               <div style={styles.mezoCsoport}>
                 <label style={styles.mezo}><span style={styles.mezoCimke}>Kategória</span>
-                  <select disabled={!canEdit} value={modal.kategoria} onChange={e=>setModal({...modal,kategoria:e.target.value})} style={styles.select}>
+                  <select disabled={!modalSzerk} value={modal.kategoria} onChange={e=>setModal({...modal,kategoria:e.target.value})} style={styles.select}>
                     {KATEGORIAK.map(k=><option key={k.id} value={k.id}>{k.ikon} {k.nev}</option>)}
                   </select>
                 </label>
                 <label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Állapot</span>
-                  <select disabled={!canEdit} value={modal.allapot} onChange={e=>setModal({...modal,allapot:e.target.value})} style={styles.select}>
+                  <select disabled={!modalSzerk} value={modal.allapot} onChange={e=>setModal({...modal,allapot:e.target.value})} style={styles.select}>
                     <option value="megerosit">Megerősített</option><option value="elozetes">Előzetes</option>
                   </select>
                 </label>
               </div>
 
-              <KollegaValaszto kollegak={kollegak} kivalasztott={modal.kollegaIds} olvas={!canEdit} onValt={(ids)=>setModal({...modal,kollegaIds:ids})}/>
+              <KollegaValaszto kollegak={kollegak} kivalasztott={modal.kollegaIds} olvas={!modalSzerk||kollegaZarolt} zaroltMegj={kollegaZarolt?"Nézőként csak magadat jelölheted.":""} onValt={(ids)=>setModal({...modal,kollegaIds:ids})}/>
 
               {utkozesek.length>0 && (
                 <div style={styles.utkozesBanner}>
@@ -545,43 +668,43 @@ function App(){
 
               <div style={styles.mezoCsoport}>
                 <div style={styles.mezo}><span style={{...styles.mezoCimke,width:"auto",flex:1}}>Egész napos</span>
-                  <Switch on={modal.egeszNapos} onClick={()=>canEdit&&setModal({...modal,egeszNapos:!modal.egeszNapos})}/></div>
+                  <Switch on={modal.egeszNapos} onClick={()=>modalSzerk&&setModal({...modal,egeszNapos:!modal.egeszNapos})}/></div>
               </div>
 
               <div style={styles.mezoCsoport}>
                 <label style={styles.mezo}><span style={styles.mezoCimke}>Kezdő nap</span>
-                  <input type="date" disabled={!canEdit} value={modal.datum} onChange={e=>{const d=e.target.value;setModal(m=>({...m,datum:d,vegDatum:m.vegDatum<d?d:m.vegDatum}));}} style={styles.input}/></label>
+                  <input type="date" disabled={!modalSzerk} value={modal.datum} onChange={e=>{const d=e.target.value;setModal(m=>({...m,datum:d,vegDatum:m.vegDatum<d?d:m.vegDatum}));}} style={styles.input}/></label>
                 {!modal.egeszNapos&&<label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Kezdés</span>
-                  <input type="time" disabled={!canEdit} value={modal.kezdo} onChange={e=>setModal({...modal,kezdo:e.target.value})} style={styles.input}/></label>}
+                  <input type="time" disabled={!modalSzerk} value={modal.kezdo} onChange={e=>setModal({...modal,kezdo:e.target.value})} style={styles.input}/></label>}
                 <label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Záró nap</span>
-                  <input type="date" disabled={!canEdit} value={modal.vegDatum} min={modal.datum} onChange={e=>{const d=e.target.value;setModal(m=>({...m,vegDatum:d<m.datum?m.datum:d}));}} style={styles.input}/></label>
+                  <input type="date" disabled={!modalSzerk} value={modal.vegDatum} min={modal.datum} onChange={e=>{const d=e.target.value;setModal(m=>({...m,vegDatum:d<m.datum?m.datum:d}));}} style={styles.input}/></label>
                 {!modal.egeszNapos&&<label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Vége</span>
-                  <input type="time" disabled={!canEdit} value={modal.veg} onChange={e=>setModal({...modal,veg:e.target.value})} style={styles.input}/></label>}
+                  <input type="time" disabled={!modalSzerk} value={modal.veg} onChange={e=>setModal({...modal,veg:e.target.value})} style={styles.input}/></label>}
               </div>
 
               {/* Ismétlés */}
               <div style={styles.mezoCsoport}>
                 <label style={styles.mezo}><span style={styles.mezoCimke}>Ismétlés</span>
-                  <select disabled={!canEdit} value={modal.ismetles} onChange={e=>setModal({...modal,ismetles:e.target.value})} style={styles.select}>
+                  <select disabled={!modalSzerk} value={modal.ismetles} onChange={e=>setModal({...modal,ismetles:e.target.value})} style={styles.select}>
                     <option value="nincs">Nincs</option><option value="nap">Naponta</option><option value="het">Hetente</option><option value="honap">Havonta</option>
                   </select>
                 </label>
                 {modal.ismetles!=="nincs"&&<label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Ismétlés vége</span>
-                  <input type="date" disabled={!canEdit} value={modal.ismetlesVeg} onChange={e=>setModal({...modal,ismetlesVeg:e.target.value})} style={styles.input}/></label>}
+                  <input type="date" disabled={!modalSzerk} value={modal.ismetlesVeg} onChange={e=>setModal({...modal,ismetlesVeg:e.target.value})} style={styles.input}/></label>}
               </div>
 
               <div style={styles.mezoCsoport}>
                 <label style={styles.mezo}><span style={styles.mezoCimke}>Helyszín</span>
-                  <input disabled={!canEdit} value={modal.helyszin} onChange={e=>setModal({...modal,helyszin:e.target.value})} placeholder="pl. 3. tárgyaló" style={styles.input}/></label>
+                  <input disabled={!modalSzerk} value={modal.helyszin} onChange={e=>setModal({...modal,helyszin:e.target.value})} placeholder="pl. 3. tárgyaló" style={styles.input}/></label>
                 <label style={{...styles.mezo,...styles.mezoElvalaszto}}><span style={styles.mezoCimke}>Online link</span>
-                  <input disabled={!canEdit} value={modal.link} onChange={e=>setModal({...modal,link:e.target.value})} placeholder="Teams / Zoom URL" style={styles.input}/></label>
+                  <input disabled={!modalSzerk} value={modal.link} onChange={e=>setModal({...modal,link:e.target.value})} placeholder="Teams / Zoom URL" style={styles.input}/></label>
               </div>
 
               {modal.link && <a href={modal.link} target="_blank" rel="noreferrer" style={styles.linkGomb}>🔗 Online hivatkozás megnyitása</a>}
 
               <div style={styles.mezoCsoport}>
                 <label style={{...styles.mezo,alignItems:"flex-start"}}><span style={{...styles.mezoCimke,paddingTop:4}}>Megjegyzés</span>
-                  <textarea disabled={!canEdit} value={modal.megjegyzes} onChange={e=>setModal({...modal,megjegyzes:e.target.value})} placeholder="Részletek…" rows={3} style={{...styles.input,resize:"none",fontFamily:"inherit"}}/></label>
+                  <textarea disabled={!modalSzerk} value={modal.megjegyzes} onChange={e=>setModal({...modal,megjegyzes:e.target.value})} placeholder="Részletek…" rows={3} style={{...styles.input,resize:"none",fontFamily:"inherit"}}/></label>
               </div>
 
               <Ertesites esemeny={modal} kollegak={kollegak}/>
@@ -590,27 +713,30 @@ function App(){
                 <div style={styles.meta}>Létrehozta: {kollegak.find(k=>k.id===modal.letrehozta)?.nev||"—"} · Módosítva: {kollegak.find(k=>k.id===modal.modositotta)?.nev||"—"}{modal.modositva?` (${modal.modositva})`:""}</div>
               )}
 
-              {modal.id&&canEdit&&<button onClick={torolModal} style={styles.torolGomb}>Esemény törlése</button>}
+              {modal.id&&modalSzerk&&<button onClick={torolModal} style={styles.torolGomb}>Esemény törlése</button>}
             </div>
           </div>
         </div>
       )}
 
-      {kollegaPanel && <KollegaPanel kollegak={kollegak} onMentes={mentKollegak} onBezar={()=>setKollegaPanel(false)}/>}
+      {kollegaPanel && isAdmin && <KollegaPanel kollegak={kollegak} onMentes={mentKollegak} onBezar={()=>setKollegaPanel(false)}/>}
 
       {beallitasok && (
         <Beallitasok kollegak={kollegak} enId={enId} onEnId={valtEnId} temaSotet={temaSotet} onTema={valtTema}
-          onIcs={osszesIcs} onCsv={csvExport} digestLink={napiDigestLink()} onNyomtat={()=>window.print()} onBezar={()=>setBeallitasok(false)}/>
+          ertAllapot={ertAllapot} onErtesites={kerErtesites}
+          onIcs={osszesIcs} onCsv={csvExport} onJson={jsonExport} onJsonImport={jsonImport} digestLink={napiDigestLink()} onNyomtat={()=>window.print()} onBezar={()=>setBeallitasok(false)}/>
       )}
     </div>
   );
 }
 
 /* ===================== Beállítások panel ===================== */
-function Beallitasok({kollegak,enId,onEnId,temaSotet,onTema,onIcs,onCsv,digestLink,onNyomtat,onBezar}){
+function Beallitasok({kollegak,enId,onEnId,temaSotet,onTema,ertAllapot,onErtesites,onIcs,onCsv,onJson,onJsonImport,digestLink,onNyomtat,onBezar}){
+  const fileRef=useRef();
+  const ertSzoveg={granted:"Bekapcsolva ✓",denied:"Letiltva – engedélyezd a böngészőben",default:"Koppints a bekapcsoláshoz",unsupported:"Nem támogatott"}[ertAllapot]||"";
   return (
     <div style={styles.overlay} onClick={onBezar}>
-      <div style={styles.lap} onClick={e=>e.stopPropagation()}>
+      <div className="sheet" style={styles.lap} onClick={e=>e.stopPropagation()}>
         <div style={styles.lapFej}><button onClick={onBezar} style={styles.lapMegse}>Kész</button><span style={styles.lapCim}>Beállítások</span><span style={{width:48}} /></div>
         <div style={styles.lapTorzs}>
           <div style={styles.mezoCsoport}>
@@ -625,14 +751,30 @@ function Beallitasok({kollegak,enId,onEnId,temaSotet,onTema,onIcs,onCsv,digestLi
             <div style={styles.mezo}><span style={{...styles.mezoCimke,width:"auto",flex:1}}>Sötét mód</span><Switch on={temaSotet} onClick={onTema}/></div>
           </div>
           <div style={styles.mezoCsoport}>
+            <button onClick={ertAllapot==="granted"||ertAllapot==="unsupported"?undefined:onErtesites}
+              style={{...styles.menuGomb, display:"flex", justifyContent:"space-between", alignItems:"center", cursor:ertAllapot==="granted"||ertAllapot==="unsupported"?"default":"pointer"}}>
+              <span>🔔 Push emlékeztetők (48h + 24h)</span>
+              <span style={{fontSize:13,color:ertAllapot==="granted"?"#34C759":"#8E8E93"}}>{ertSzoveg}</span>
+            </button>
+          </div>
+          <div style={styles.mezoCsoport}>
             <a href={digestLink} style={styles.menuGomb}>📧 Mai program kiküldése e-mailben</a>
             <button onClick={onIcs} style={{...styles.menuGomb,borderTop:"1px solid var(--line)"}}>📅 Teljes naptár exportálása (.ics)</button>
             <button onClick={onCsv} style={{...styles.menuGomb,borderTop:"1px solid var(--line)"}}>📄 Exportálás táblázatba (.csv)</button>
             <button onClick={onNyomtat} style={{...styles.menuGomb,borderTop:"1px solid var(--line)"}}>🖨️ Nyomtatás</button>
           </div>
+          <div style={styles.mezoCsoport}>
+            <button onClick={onJson} style={styles.menuGomb}>💾 Biztonsági mentés (.json)</button>
+            <button onClick={()=>fileRef.current&&fileRef.current.click()} style={{...styles.menuGomb,borderTop:"1px solid var(--line)"}}>♻️ Visszatöltés mentésből (.json)</button>
+            <input ref={fileRef} type="file" accept="application/json,.json" style={{display:"none"}}
+              onChange={e=>{ const f=e.target.files&&e.target.files[0]; if(!f) return; const r=new FileReader(); r.onload=()=>onJsonImport(String(r.result)); r.readAsText(f); e.target.value=""; }}/>
+          </div>
           <p style={{fontSize:12,color:"#8E8E93",lineHeight:1.5}}>
             A „ki vagy te?" és a sötét mód csak ezen az eszközön érvényes. Az események és kollégák megosztottak.
-            Az .ics fájlt bárki importálhatja a saját naptárába (Google/Outlook), és onnantól automatikusan emlékeztet.
+            A push emlékeztetőhöz állítsd be, hogy „ki vagy te?", és engedélyezd az értesítéseket – ekkor 48 és 24 órával a téged érintő események előtt jelzést kapsz ezen az eszközön.
+            Fontos: teljesen bezárt appnál a kézbesítés böngészőfüggő; a garantált értesítéshez (akár napokkal előre, kikapcsolt appnál) háttérszerver (Web Push) kell.
+            Az .ics fájlt bárki importálhatja a saját naptárába (Google/Outlook), és onnantól az is automatikusan emlékeztet.
+            A biztonsági mentés (.json) minden adatot elment; visszatöltéskor felülírja a jelenlegieket – érdemes rendszeresen menteni.
           </p>
           <div style={{textAlign:"center",fontSize:11,color:"#C7C7CC",marginTop:8}}>{APP_NEV} {VERZIO}</div>
         </div>
@@ -658,19 +800,20 @@ function Ertesites({esemeny,kollegak}){
 }
 
 /* ===================== Több kolléga választó ===================== */
-function KollegaValaszto({kollegak,kivalasztott,onValt,olvas}){
+function KollegaValaszto({kollegak,kivalasztott,onValt,olvas,zaroltMegj}){
   const [nyitva,setNyitva]=useState(false);
   const valt=(id)=>!olvas&&onValt(kivalasztott.includes(id)?kivalasztott.filter(x=>x!==id):[...kivalasztott,id]);
   const nevek=kivalasztott.map(id=>kollegak.find(k=>k.id===id)).filter(Boolean);
   return (
     <div style={styles.mezoCsoport}>
-      <button onClick={()=>setNyitva(n=>!n)} style={{...styles.mezo,width:"100%",background:"none",border:"none",cursor:"pointer",textAlign:"left"}}>
+      <button onClick={()=>!zaroltMegj&&setNyitva(n=>!n)} style={{...styles.mezo,width:"100%",background:"none",border:"none",cursor:zaroltMegj?"default":"pointer",textAlign:"left"}}>
         <span style={styles.mezoCimke}>Kollégák</span>
         <span style={{flex:1,fontSize:15,color:nevek.length?"var(--txt)":"#C7C7CC",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>
-          {nevek.length?nevek.map((k,i)=><span key={k.id} style={{color:szinHex(k.szin),fontWeight:600}}>{k.nev}{i<nevek.length-1?", ":""}</span>):"Válassz egy vagy több kollégát"}
+          {nevek.length?nevek.map((k,i)=><span key={k.id} style={{color:szinHex(k.szin),fontWeight:600}}>{k.nev}{i<nevek.length-1?", ":""}</span>):(zaroltMegj?"—":"Válassz egy vagy több kollégát")}
         </span>
-        <span style={{color:"#C7C7CC",marginLeft:6,transform:nyitva?"rotate(90deg)":"none",transition:"transform .15s"}}>›</span>
+        {!zaroltMegj&&<span style={{color:"#C7C7CC",marginLeft:6,transform:nyitva?"rotate(90deg)":"none",transition:"transform .15s"}}>›</span>}
       </button>
+      {zaroltMegj&&<div style={{padding:"0 14px 10px",fontSize:12,color:"#8E8E93"}}>{zaroltMegj}</div>}
       {nyitva&&(
         <div style={{borderTop:"1px solid var(--line)"}}>
           {kollegak.length===0&&<div style={{padding:"12px 14px",color:"#8E8E93",fontSize:14}}>Nincs kolléga.</div>}
@@ -698,15 +841,15 @@ function Switch({on,onClick}){
 
 /* ===================== Kolléga kezelő ===================== */
 function KollegaPanel({kollegak,onMentes,onBezar}){
-  const [lista,setLista]=useState(kollegak.map(k=>({email:"",csapat:"",szerep:"szerkeszto",...k})));
+  const [lista,setLista]=useState(kollegak.map(k=>{ const y={email:"",csapat:"",szerep:"nezo",...k}; y.szerep=normSzerep(y.szerep); return y; }));
   const [ujNev,setUjNev]=useState("");
   const hasznalt=lista.map(k=>k.szin); const kov=SZINEK.find(s=>!hasznalt.includes(s.id))?.id||SZINEK[0].id;
-  const hozzaad=()=>{ if(!ujNev.trim())return; setLista([...lista,{id:ujId(),nev:ujNev.trim(),szin:kov,email:"",csapat:"",szerep:"szerkeszto"}]); setUjNev(""); };
+  const hozzaad=()=>{ if(!ujNev.trim())return; setLista([...lista,{id:ujId(),nev:ujNev.trim(),szin:kov,email:"",csapat:"",szerep:"nezo"}]); setUjNev(""); };
   const torol=(id)=>setLista(lista.filter(k=>k.id!==id));
   const valt=(id,m,v)=>setLista(lista.map(k=>k.id===id?{...k,[m]:v}:k));
   return (
     <div style={styles.overlay} onClick={onBezar}>
-      <div style={styles.lap} onClick={e=>e.stopPropagation()}>
+      <div className="sheet" style={styles.lap} onClick={e=>e.stopPropagation()}>
         <div style={styles.lapFej}><button onClick={onBezar} style={styles.lapMegse}>Mégse</button><span style={styles.lapCim}>Kollégák</span>
           <button onClick={()=>{onMentes(lista);onBezar();}} style={{...styles.lapKesz,opacity:1}}>Kész</button></div>
         <div style={styles.lapTorzs}>
@@ -724,7 +867,7 @@ function KollegaPanel({kollegak,onMentes,onBezar}){
                 style={{...styles.kartyaInput,color:k.email&&!ervenyesEmail(k.email)?"#FF3B30":"var(--txt)"}}/>
               <div style={{display:"flex",gap:10}}>
                 <input value={k.csapat||""} onChange={e=>valt(k.id,"csapat",e.target.value)} placeholder="Csapat / részleg" style={{...styles.kartyaInput,flex:1}}/>
-                <select value={k.szerep||"szerkeszto"} onChange={e=>valt(k.id,"szerep",e.target.value)} style={{...styles.kartyaInput,flex:1}}>
+                <select value={normSzerep(k.szerep)} onChange={e=>valt(k.id,"szerep",e.target.value)} style={{...styles.kartyaInput,flex:1}}>
                   {SZEREPEK.map(s=><option key={s.id} value={s.id}>{s.nev}</option>)}
                 </select>
               </div>
@@ -774,10 +917,11 @@ const styles={
   racs:{ display:"grid", gridTemplateColumns:"repeat(7,1fr)", background:"var(--card)", padding:"4px 6px 10px" },
   cellaGomb:{ background:"none", border:"none", cursor:"pointer", padding:"4px 0 2px", display:"flex", flexDirection:"column", alignItems:"center", gap:3, minHeight:50 },
   napSzam:{ width:30, height:30, lineHeight:"30px", borderRadius:30, fontSize:16, fontWeight:500, textAlign:"center" },
-  pontSor:{ display:"flex", gap:2, height:6, alignItems:"center" },
+  pontSor:{ display:"flex", gap:3, height:8, alignItems:"center", justifyContent:"center" },
   agenda:{ flex:1, padding:"8px 0 30px" },
   agendaFej:{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", padding:"12px 18px 6px" },
-  agendaDatum:{ fontSize:17, fontWeight:700, letterSpacing:"-0.3px" },
+  agendaDatum:{ fontSize:17, fontWeight:700, letterSpacing:"-0.3px", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" },
+  napChevron:{ background:"none", border:"none", fontSize:24, color:"#FF3B30", cursor:"pointer", lineHeight:1, padding:"0 4px", fontWeight:300, flexShrink:0 },
   agendaPlus:{ background:"none", border:"none", color:"#FF3B30", fontWeight:600, fontSize:15, cursor:"pointer", whiteSpace:"nowrap" },
   jelenletSav:{ padding:"4px 16px 10px", borderBottom:"1px solid var(--line)" },
   jelenletCim:{ fontSize:12, fontWeight:700, textTransform:"uppercase", letterSpacing:"0.5px", color:"#8E8E93", marginBottom:6 },
@@ -794,12 +938,12 @@ const styles={
   hetUres:{ padding:"8px 16px", color:"#C7C7CC", fontSize:14 },
   talalatDatum:{ padding:"6px 16px 0", fontSize:12, fontWeight:700, color:"#8E8E93" },
   overlay:{ position:"fixed", inset:0, background:"rgba(0,0,0,0.4)", display:"flex", alignItems:"flex-end", justifyContent:"center", zIndex:50 },
-  lap:{ background:"var(--bg)", width:"100%", maxWidth:560, borderTopLeftRadius:16, borderTopRightRadius:16, maxHeight:"92vh", overflowY:"auto", animation:"fel .25s ease" },
-  lapFej:{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 16px", position:"sticky", top:0, background:"var(--bg)", borderBottom:"1px solid var(--line)", zIndex:2 },
+  lap:{ background:"var(--bg)", width:"100%", maxWidth:560, borderTopLeftRadius:16, borderTopRightRadius:16, display:"flex", flexDirection:"column", overflow:"hidden", animation:"fel .25s ease" },
+  lapFej:{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"14px 16px", background:"var(--bg)", borderBottom:"1px solid var(--line)", zIndex:2, flexShrink:0 },
   lapMegse:{ background:"none", border:"none", color:"#FF3B30", fontSize:16, cursor:"pointer", minWidth:48, textAlign:"left" },
   lapCim:{ fontSize:16, fontWeight:700 },
   lapKesz:{ background:"none", border:"none", color:"#FF3B30", fontSize:16, fontWeight:700, cursor:"pointer", minWidth:48, textAlign:"right" },
-  lapTorzs:{ padding:16 },
+  lapTorzs:{ padding:16, paddingBottom:"calc(16px + env(safe-area-inset-bottom))", flex:1, minHeight:0, overflowY:"auto", WebkitOverflowScrolling:"touch", overscrollBehavior:"contain" },
   olvasBanner:{ background:"#FFF3CD", color:"#7A5C00", borderRadius:10, padding:"10px 12px", fontSize:13, marginBottom:14 },
   utkozesBanner:{ background:"#FFF3CD", color:"#7A5C00", borderRadius:10, padding:"10px 12px", fontSize:13, marginBottom:16, marginTop:-6 },
   cimInput:{ width:"100%", boxSizing:"border-box", background:"var(--card)", border:"none", borderRadius:12, padding:"14px", fontSize:18, fontWeight:600, marginBottom:16, outline:"none", color:"var(--txt)" },
@@ -834,6 +978,11 @@ const css=`
   input:disabled, select:disabled, textarea:disabled { opacity: 1; -webkit-text-fill-color: var(--txt); }
   select option { color:#000; }
   ::-webkit-scrollbar { height:0; width:0; }
+  /* Alsó lap (modal) magasság – dinamikus viewport, hogy fekvő telefonon is elférjen a fejléc + Kész gomb */
+  .sheet { max-height: 92vh; max-height: 92dvh; }
+  @media (max-height: 560px) {
+    .sheet { max-height: 100vh; max-height: 100dvh; border-top-left-radius: 0; border-top-right-radius: 0; }
+  }
   @media print { header, footer, .nyomtatasRejt { display:none !important; } }
 `;
 
